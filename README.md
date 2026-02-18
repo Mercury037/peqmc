@@ -1,10 +1,10 @@
 # PEMC
 
-Training
+Training            
 `python train.py`
 
-Test
+Test            
 `python test.py`
 
-Plot result
+Plot result         
 `python plots.py`
