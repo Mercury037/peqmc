@@ -56,7 +56,7 @@ def simulate_gbm_batch(theta, batch_size, nD=256, T=1.0, device="cpu"):
 
 def arithmetic_payoff(S, K):
     A = S.mean(dim=1)
-    return torch.clamp(A - K, min=0.0)
+    return torch.clamp(A - K, min=0.0) #min下界
 
 def geometric_payoff(S, K):
     G = torch.exp(torch.log(S).mean(dim=1))

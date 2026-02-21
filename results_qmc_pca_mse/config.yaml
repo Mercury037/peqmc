@@ -1,0 +1,10 @@
+batch_size: 128
+dataset_size: 8192
+device: cpu
+dimX: 16
+dropout: 0.1
+epochs: 100
+lr: 0.001
+seed: 42
+train_ratio: 0.7
+val_ratio: 0.15
