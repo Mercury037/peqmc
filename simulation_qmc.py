@@ -3,8 +3,22 @@ import matplotlib.pyplot as plt
 import math
 import torch
 from torch.quasirandom import SobolEngine
+from utils import *
 
-
+"""
+生成矩阵
+    cholesky
+    bb
+    pca
+    gpca
+    
+模拟theta
+    合并: [B,N,4],[B,4] 
+        if_same
+模拟轨道
+    mc
+    qmc
+"""
 def Cholesky(n: int, T: float = 1) -> np.ndarray:
     if n <= 0:
         raise ValueError("n must be positive.")
@@ -85,38 +99,7 @@ def BB(n: int, T:float =1) -> np.ndarray:
 
     return np.round(A, 4)*np.sqrt(T)
 
-# # 1) 4x4
-# A4 = BB(4)
-# print("A (n=2, 4x4):\n", A4)
-#
-# # 2) 8x8
-# A8 = BB(8,8)
-# print("\nA (n=3, 8x8):\n", A8)
-#
-# # 3) 验证协方差：R 里 as.integer 是向0截断
-# cov_int = np.trunc( (A8 @ A8.T)).astype(int)
-# target = np.fromfunction(lambda i, j: np.minimum(i + 1, j + 1), (8, 8), dtype=int)
-#
-# print("\ntrunc(8 * A A^T):\n", cov_int)
-# print("\nTarget min(i,j):\n", target)
-# print("\nMatch?", np.array_equal(cov_int, target))
-
-
-def _to_batch_param(x, batch_size, device, dtype=torch.float32):
-    """
-    可以给单个的去广播，也可以传B个
-    """
-    if torch.is_tensor(x):
-        x = x.to(device=device, dtype=dtype)
-        if x.ndim == 0:
-            return x.expand(batch_size)
-        if x.ndim == 1 and x.shape[0] == batch_size:
-            return x
-        raise ValueError(f"param must be scalar or [B], got {tuple(x.shape)}")
-    return torch.full((batch_size,), float(x), device=device, dtype=dtype)
-
-
-def _generator_matrix(method: str, nD: int, T: float, device: str, dtype=torch.float32) -> torch.Tensor:
+def generator_matrix(method: str, nD: int, T: float, device: str, dtype=torch.float32) -> torch.Tensor:
     """
     选生成矩阵
     """
@@ -134,101 +117,268 @@ def _generator_matrix(method: str, nD: int, T: float, device: str, dtype=torch.f
         raise ValueError("method must be one of {'cholesky','pca','bb'}")
     return torch.tensor(G, device=device, dtype=dtype)
 
-def simulate_gbm_batch_mc(theta, batch_size, nD=256, T=1.0, device="cpu", method="cholesky"):
+
+
+
+import torch
+
+def sample_theta(
+    mode,                    # 2 or 3
+    batch_size=None,         # mode=2 时用
+    B=None, N=None,          # mode=3 时用
+    is_same=False,           # 是否所有元素都共享同一个值
+    theta_same=None,         # is_same=True 时必须传: (r, S0, sigma, K)
+    device="cpu",
+    gen=None
+):
     """
-    theta: (r,S0,sigma,K) each is torch scalar or shape [B]
-    returns:
-      W: [B, nD] Brownian motion at t_1..t_nD
-      S: [B, nD] GBM price at t_1..t_nD
+    返回:
+      r, S0, sigma, K
+
+    mode=2:
+      每个参数 shape = [batch_size]
+      - is_same=False: 每个样本独立采样
+      - is_same=True : 使用 theta_same 中给定的标量，广播到 [batch_size]
+
+    mode=3:
+      每个参数 shape = [B, N]
+      - is_same=False: 先采 [B,1]，再沿 N 维复制到 [B,N]
+                      （即每个 i 的 [i,:] 全相同）
+      - is_same=True : 使用 theta_same 中给定的标量，广播到 [B,N]
     """
-    r, S0, sigma, K = theta  # K 保留接口一致，但路径生成不需要它
+    if mode not in (2, 3):
+        raise ValueError(f"mode 必须是 2 或 3，收到: {mode}")
 
-    r = _to_batch_param(r, batch_size, device)          # [B,]
-    S0 = _to_batch_param(S0, batch_size, device)        # [B,]
-    sigma = _to_batch_param(sigma, batch_size, device)  # [B,]
-    K = _to_batch_param(K, batch_size, device)          # [B,]
+    def _u(low, high, shape):
+        return low + (high - low) * torch.rand(*shape, device=device, generator=gen)
 
-    # W = Z @ G^T
-    G = _generator_matrix(method, nD=nD, T=T, device=device, dtype=torch.float32)  # [nD,nD]
-    Z = torch.randn(batch_size, nD, device=device)                                 # [B,nD]
-    W = Z @ G.T                                                                    # [B,nD]
+    def _to_scalar_tensor(x, name):
+        """
+        把 python 数 / 0维tensor / 单元素tensor 转成 device 上的 0维 tensor
+        """
+        t = torch.as_tensor(x, device=device, dtype=torch.float32)
+        if t.numel() != 1:
+            raise ValueError(f"theta_same 中的 {name} 必须是标量或单元素张量，收到 shape={tuple(t.shape)}")
+        return t.reshape(())
 
-    dt = T / nD
-    t = (torch.arange(1, nD + 1, device=device, dtype=torch.float32) * dt).unsqueeze(0)  # [1,nD]
+    # 参数范围（仅 is_same=False 时使用）
+    ranges = {
+        "r":     (0.01, 0.03),
+        "S0":    (80.0, 120.0),
+        "sigma": (0.05, 0.25),
+        "K":     (90.0, 110.0),
+    }
 
-    logS = torch.log(S0).unsqueeze(1) + (r - 0.5 * sigma**2).unsqueeze(1) * t + sigma.unsqueeze(1) * W
-    S = torch.exp(logS)
+    # ---------- 固定参数模式：不随机 ----------
+    if is_same:
+        if theta_same is None:
+            raise ValueError("is_same=True 时必须传 theta_same=(r, S0, sigma, K)")
+        if len(theta_same) != 4:
+            raise ValueError(f"theta_same 长度必须是4，收到长度={len(theta_same)}")
 
-    return Z,W,S
+        r0, S00, sigma0, K0 = theta_same
+        r0     = _to_scalar_tensor(r0, "r")
+        S00    = _to_scalar_tensor(S00, "S0")
+        sigma0 = _to_scalar_tensor(sigma0, "sigma")
+        K0     = _to_scalar_tensor(K0, "K")
 
+        if mode == 2:
+            if batch_size is None:
+                raise ValueError("mode=2 时必须传 batch_size")
 
-def sample_theta(batch_size, device="cpu", gen=None):
-    r = 0.01 + (0.03 - 0.01) * torch.rand(batch_size, device=device, generator=gen)
-    S0 = 80.0 + (120.0 - 80.0) * torch.rand(batch_size, device=device, generator=gen)
-    sigma = 0.05 + (0.25 - 0.05) * torch.rand(batch_size, device=device, generator=gen)
-    K = 90.0 + (110.0 - 90.0) * torch.rand(batch_size, device=device, generator=gen)
+            r     = r0.expand(batch_size)
+            S0    = S00.expand(batch_size)
+            sigma = sigma0.expand(batch_size)
+            K     = K0.expand(batch_size)
+
+        else:  # mode == 3
+            if B is None or N is None:
+                raise ValueError("mode=3 时必须传 B 和 N")
+
+            r     = r0.expand(B, N)
+            S0    = S00.expand(B, N)
+            sigma = sigma0.expand(B, N)
+            K     = K0.expand(B, N)
+
+        return r, S0, sigma, K
+
+    # ---------- 随机采样模式 ----------
+    if mode == 2:
+        if batch_size is None:
+            raise ValueError("mode=2 时必须传 batch_size")
+
+        r     = _u(*ranges["r"],     (batch_size,))
+        S0    = _u(*ranges["S0"],    (batch_size,))
+        sigma = _u(*ranges["sigma"], (batch_size,))
+        K     = _u(*ranges["K"],     (batch_size,))
+
+    else:  # mode == 3
+        if B is None or N is None:
+            raise ValueError("mode=3 时必须传 B 和 N")
+
+        # 先采 [B,1]，再沿 N 维复制到 [B,N]
+        r     = _u(*ranges["r"],     (B, 1)).expand(B, N)
+        S0    = _u(*ranges["S0"],    (B, 1)).expand(B, N)
+        sigma = _u(*ranges["sigma"], (B, 1)).expand(B, N)
+        K     = _u(*ranges["K"],     (B, 1)).expand(B, N)
+
     return r, S0, sigma, K
 
 
-## qmc的simulation
-
-def _norm_ppf_torch(U: torch.Tensor) -> torch.Tensor:
+def draw_Z_block_qmc(num_points, nD, device="cpu", *,
+                      scramble=True, seed=42, block_idx=0,
+                      sobol_engine=None, dtype=torch.float32):
     """
-    标准正态的 Phi^{-1}(U)，纯 torch 实现
-    Phi^{-1}(u) = sqrt(2) * erfinv(2u - 1)
+    返回 [num_points, nD] 的标准正态QMC样本 Z
+
+    - 若 sobol_engine is None: 用 seed+block_idx 新建 engine（适合 RQMC 独立随机化块）
+    - 若传入 sobol_engine: 连续 draw（同一 digital sequence，理论上一直不用传）
     """
-    eps = torch.finfo(U.dtype).eps
-    U = U.clamp(min=eps, max=1.0 - eps)   # 避免 ppf(0/1) 变成 ±inf
-    return math.sqrt(2.0) * torch.erfinv(2.0 * U - 1.0)
-
-
-def simulate_gbm_batch_qmc(theta, batch_size, nD=256, T=1.0, device="cpu", method="cholesky",
-                           scramble=True, seed=42, sobol_engine=None):
-    """
-    theta: (r,S0,sigma,K) each is torch scalar or shape [B]
-    returns:
-      W: [B, nD] Brownian motion at t_1..t_nD
-      S: [B, nD] GBM price at t_1..t_nD
-      如果不传sobol_engine qmc生成器，那么每次都是根据seed重新来一个，
-      如果传的话，就是跟着外面的走，循环调用 每次都是不同的rqmc点
-    """
-    r, S0, sigma, K = theta  # K 保留接口一致，但路径生成不需要它
-
-    r = _to_batch_param(r, batch_size, device)          # [B,]
-    S0 = _to_batch_param(S0, batch_size, device)        # [B,]
-    sigma = _to_batch_param(sigma, batch_size, device)  # [B,]
-    K = _to_batch_param(K, batch_size, device)          # [B,]
-
-    # ---- QMC 生成 Z ~ N(0,1)^{nD} ----
-    # 默认强制 batch_size=2^m（最规整）
-    if batch_size & (batch_size - 1) != 0:
-        raise ValueError(f"[qmc] batch_size must be a power of 2 (2^m), got {batch_size}")
+    check_power_of_two(num_points, name="num_points")
 
     if sobol_engine is None:
-        # 注意：如果你每次都在函数里新建 engine + 固定 seed，那么每次都会从头开始，Z 会重复
-        sobol_engine = SobolEngine(dimension=nD, scramble=scramble, seed=seed)
+        eng = SobolEngine(dimension=nD, scramble=scramble, seed=seed + block_idx)
+        U = eng.draw(num_points).to(device=device, dtype=dtype)
+    else:
+        U = sobol_engine.draw(num_points).to(device=device, dtype=dtype)
 
-    U = sobol_engine.draw(batch_size).to(device=device, dtype=torch.float32)  # [B,nD] in [0,1)
-    Z = _norm_ppf_torch(U)                                                    # [B,nD] ~ N(0,1)
+    Z = inv_Phi_torch(U)  # [num_points, nD]
+    return Z
 
-    # ---- W = Z @ G^T ----
-    G = _generator_matrix(method, nD=nD, T=T, device=device, dtype=torch.float32)  # [nD,nD]
-    W = Z @ G.T                                                                    # [B,nD]
 
+def simulate_gbm_batch_qmc(theta, nD=256, T=1.0, device="cpu", method="pca",
+                           scramble=True, seed=37, sobol_engine=None):
+    """
+    QMC / RQMC 生成 GBM 路径
+    不传轨道数和块数，和theta保持一致
+
+    Parameters
+    ----------
+    theta : tuple (r, S0, sigma, K)
+        - 情况1：每个参数 shape=[B]
+        - 情况2：每个参数 shape=[B, N]
+    batch_size : int
+        - 情况1（dim==1）: 应等于 B
+        - 情况2（dim==2）: 应等于 N（每个 block 的 QMC 点数）
+    nD : int
+        时间离散维度（也是 QMC 维度）
+    T : float
+        到期时间
+    device : str
+        "cpu" / "cuda"
+    method : str
+        生成矩阵方法（如 "cholesky", "bb", "pca"）
+    scramble : bool
+        Sobol scramble 开关
+    seed : int
+        基础随机种子
+    sobol_engine : SobolEngine or None
+        - None: 内部创建 engine
+        - 非 None: 使用外部 engine 连续 draw
+
+    Returns
+    -------
+    Z, W, S
+        - 若 theta 为 [B]，则返回 shape=[B, nD]
+        - 若 theta 为 [B,N]，则返回 shape=[B, N, nD]
+
+    Notes
+    -----
+    - dim==2 时，如果 sobol_engine is None，会对每个 b 用 seed+b 创建一个独立 scramble 的 SobolEngine，即不同块是独立的
+    """
+    r, S0, sigma, K = theta
+    dtype = torch.float32
+    r = r.to(device=device, dtype=dtype)
+    S0 = S0.to(device=device, dtype=dtype)
+    sigma = sigma.to(device=device, dtype=dtype)
+    K = K.to(device=device, dtype=dtype)  # noqa: F841  # 保留接口一致，路径里不使用
+
+    # 预计算：生成矩阵 + 时间网格
+    G = generator_matrix(method, nD=nD, T=T, device=device, dtype=dtype)  # [nD, nD]
     dt = T / nD
-    t = (torch.arange(1, nD + 1, device=device, dtype=torch.float32) * dt).unsqueeze(0)  # [1,nD]
+    t = torch.arange(1, nD + 1, device=device, dtype=dtype) * dt           # [nD]
 
-    logS = torch.log(S0).unsqueeze(1) + (r - 0.5 * sigma**2).unsqueeze(1) * t + sigma.unsqueeze(1) * W
-    S = torch.exp(logS)
+    # ============================================================
+    # Case 1: theta 参数是 [B]
+    # 返回 [B, nD]
+    # ============================================================
+    if S0.dim() == 1:
+        B = S0.shape[0]
+        check_power_of_two(B, name="batch_size")
 
-    return Z,W, S
+        # QMC -> Z: [B, nD]
+        Z = draw_Z_block_qmc(num_points=B, nD=nD, device=device, scramble=scramble, seed=seed, block_idx=0,
+                              sobol_engine=sobol_engine, dtype=dtype)
+
+        # W = Z @ G^T
+        W = Z @ G.T  # [B, nD]
+
+        # GBM closed-form on grid t_j
+        # log S_t = logS0 + (r - 0.5 sigma^2)t + sigma W_t
+        logS = (
+            torch.log(S0).unsqueeze(1) +
+            (r - 0.5 * sigma**2).unsqueeze(1) * t.unsqueeze(0) +
+            sigma.unsqueeze(1) * W
+        )  # [B, nD]
+
+        S = torch.exp(logS)  # [B, nD]
+        return Z, W, S
+
+    # ============================================================
+    # Case 2: theta 参数是 [B, N]
+    # 返回 [B, N, nD]
+    # ============================================================
+    elif S0.dim() == 2:
+        B, N = S0.shape
+        check_power_of_two(N, name="N")
+
+        # 逐个 block 生成 Z_b: [N, nD]
+        # 若 sobol_engine is None，则 block_idx=b -> seed+b，不同 scramble，生成独立的块
+        Z_list = []
+        for b in range(B):
+            Z_b = draw_Z_block_qmc(num_points=N, nD=nD, device=device, scramble=scramble, seed=seed, block_idx=b,
+                                   sobol_engine=sobol_engine, dtype=dtype)
+            Z_list.append(Z_b)
+
+        Z = torch.stack(Z_list, dim=0)  # [B, N, nD]
+
+        # W = Z @ G^T
+        # [B,N,nD] @ [nD,nD] -> [B,N,nD]
+        W = torch.matmul(Z, G.T)
+
+        # broadcast 时间维
+        t3 = t.view(1, 1, nD)  # [1,1,nD]
+
+        logS = (
+            torch.log(S0).unsqueeze(-1) +
+            (r - 0.5 * sigma**2).unsqueeze(-1) * t3 +
+            sigma.unsqueeze(-1) * W
+        )  # [B, N, nD]
+
+        S = torch.exp(logS)  # [B, N, nD]
+        return Z, W, S
+
+    else:
+        raise ValueError(f"[qmc] theta.dim() must be 1 or 2, got {S0.dim()}")
+
 
 
 def features_from_Z(Z, dimX):
-    # Z: [B, nD]
-    if dimX <= 0 or dimX > Z.shape[1]:
-        raise ValueError(f"dimX must be in [1, {Z.shape[1]}], got {dimX}")
-    return Z[:, :dimX]
+    """
+    从 Z 的最后一维截取前 dimX 个特征。
+
+    支持：
+      - Z: [B, nD]      -> 返回 [B, dimX]
+      - Z: [B, N, nD]   -> 返回 [B, N, dimX]
+      - 更一般地：[..., nD] -> [..., dimX]
+    """
+    if Z.dim() < 2:
+        raise ValueError(f"Z must have at least 2 dims, got shape={tuple(Z.shape)}")
+    nD = Z.shape[-1]
+    if dimX <= 0 or dimX > nD:
+        raise ValueError(f"dimX must be in [1, {nD}], got {dimX}")
+
+    return Z[..., :dimX]
 
 
 

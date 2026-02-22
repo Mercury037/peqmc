@@ -6,9 +6,6 @@ import json
 import os
 import random
 import shutil
-
-from torch.xpu import device
-
 from model import PEMCNet
 from simulation_mc import *
 from simulation_qmc import *
@@ -19,9 +16,8 @@ import yaml
 current_working_directory = os.getcwd()
 print("CWD =", current_working_directory)
 #保存路径
-results_dir = os.path.join(current_working_directory, "results_qmc_pca_mse")
+results_dir = os.path.join(current_working_directory, "results_qmc_pca_ms se")
 print("Results directory:", results_dir)
-
 
 
 class Config:
@@ -41,13 +37,9 @@ class Config:
         self.lr = 1e-3  #初始学习率
         self.dropout = 0.1
 
+
 cfg = Config()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-
-
-s = 1
 
 # =============================
 # 2️⃣ 工具函数
@@ -63,22 +55,20 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-# def generate_dataset(cfg):
-#     r, S0, sigma, K = sample_theta(cfg.dataset_size, device=cfg.device)
-#     S, dW = simulate_gbm_batch((r, S0, sigma, K), cfg.dataset_size, device=cfg.device)
-#
-#     PA = arithmetic_payoff(S, K).unsqueeze(1)
-#     X = features_from_dW(dW, dimX=cfg.dimX)
-#     theta = torch.stack([r, S0, sigma, K], dim=1)
-#
-#     return TensorDataset(theta, X, PA)
+def generate_dataset(cfg):
+    r, S0, sigma, K = sample_theta(cfg.dataset_size, device=cfg.device)
+    S, dW = simulate_gbm_batch((r, S0, sigma, K), cfg.dataset_size, device=cfg.device)
+
+    PA = arithmetic_payoff(S, K).unsqueeze(1)
+    X = features_from_dW(dW, dimX=cfg.dimX)
+    theta = torch.stack([r, S0, sigma, K], dim=1)
+
+    return TensorDataset(theta, X, PA)
 
 
-def generate_dataset(cfg,theta):
-    # r, S0, sigma, K = sample_theta(mode=2,batch_size=cfg.dataset_size, device=cfg.device)
-    r, S0, sigma, K = theta
-
-    Z,W,S = simulate_gbm_batch_qmc((r, S0, sigma, K),method="pca", device=cfg.device)
+def generate_dataset(cfg):
+    r, S0, sigma, K = sample_theta(cfg.dataset_size, device=cfg.device)
+    Z,W,S = simulate_gbm_batch_qmc((r, S0, sigma, K), batch_size=cfg.dataset_size,method="pca", device=cfg.device)
     PA = arithmetic_payoff(S, K).unsqueeze(1)
     X = features_from_Z(Z, dimX=cfg.dimX)
     theta = torch.stack([r, S0, sigma, K], dim=1)
@@ -144,7 +134,7 @@ def train_model(train_loader, val_loader, norm, cfg):
         for step, (theta, X, y) in enumerate(train_loader):
 
             theta, X, y = theta.to(cfg.device), X.to(cfg.device), y.to(cfg.device)
-            theta, X = normalize(theta, X, norm)
+            theta, X, y = normalize(theta, X, y, norm)
 
             pred = net(theta, X)
             loss = F.mse_loss(pred, y)
@@ -165,7 +155,7 @@ def train_model(train_loader, val_loader, norm, cfg):
         with torch.no_grad():
             for theta, X, y in val_loader:
                 theta, X, y = theta.to(cfg.device), X.to(cfg.device), y.to(cfg.device)
-                theta, X = normalize(theta, X, norm)
+                theta, X, y = normalize(theta, X, y, norm)
 
                 pred = net(theta, X)
                 loss = F.mse_loss(pred, y, reduction="sum")
@@ -193,7 +183,7 @@ def evaluate(net, loader, norm, cfg):
     with torch.no_grad():
         for theta, X, y in loader:
             theta, X, y = theta.to(cfg.device), X.to(cfg.device), y.to(cfg.device)
-            theta, X = normalize(theta, X, norm)
+            theta, X, y = normalize(theta, X, y, norm)
 
             pred = net(theta, X)
             loss = F.mse_loss(pred, y, reduction="sum")
@@ -207,58 +197,46 @@ def evaluate(net, loader, norm, cfg):
 
 
 def main():
-    set_seed(cfg.seed)
-    theta = (
-        torch.tensor(0.02, device=cfg.device),  # r
-        torch.tensor(100.0, device=cfg.device),  # S0
-        torch.tensor(0.15, device=cfg.device),  # sigma
-        torch.tensor(100.0, device=cfg.device),  # K
-    )
-    r, S0, sigma, K = sample_theta(
-        mode=2,
-        batch_size=cfg.dataset_size,
-        is_same=False,
-        theta_same=theta,
-        device=device
-    )
-    dataset = generate_dataset(cfg,theta=(r, S0, sigma, K))
 
-    train_set, val_set, test_set = split_dataset(dataset, cfg)
+        set_seed(cfg.seed)
 
-    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=cfg.batch_size)
-    test_loader = DataLoader(test_set, batch_size=cfg.batch_size)
+        dataset = generate_dataset(cfg)
+        train_set, val_set, test_set = split_dataset(dataset, cfg)
 
-    norm = compute_normalization(train_set, cfg)
+        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True)
+        val_loader = DataLoader(val_set, batch_size=cfg.batch_size)
+        test_loader = DataLoader(test_set, batch_size=cfg.batch_size)
 
-    net, first_step_loss, train_losses, val_losses = train_model(
-        train_loader, val_loader, norm, cfg
-    )
+        norm = compute_normalization(train_set, cfg)
 
-    test_loss = evaluate(net, test_loader, norm, cfg)
+        net, first_step_loss, train_losses, val_losses = train_model(
+            train_loader, val_loader, norm, cfg
+        )
 
-    print("Final Test Loss:", test_loss)
+        test_loss = evaluate(net, test_loader, norm, cfg)
 
-    # ===== 保存 =====
-    if os.path.exists(results_dir):
-        shutil.rmtree(results_dir)
+        print("Final Test Loss:", test_loss)
 
-    os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
+        # ===== 保存 =====
+        if os.path.exists(results_dir):
+            shutil.rmtree(results_dir)
 
-    #保存模型参数 和 norm用训练集估计的均值
-    torch.save(net.state_dict(), f"{results_dir}/model.pth")
-    torch.save(norm, f"{results_dir}/normalization.pth")
+        os.makedirs(results_dir, exist_ok=True)
+        os.makedirs(results_dir, exist_ok=True)
 
-    # 训练损失
-    np.save(f"{results_dir}/train_losses.npy", np.array(train_losses))
-    np.save(f"{results_dir}/val_losses.npy", np.array(val_losses))
+        #保存模型参数 和 norm用训练集估计的均值
+        torch.save(net.state_dict(), f"{results_dir}/model.pth")
+        torch.save(norm, f"{results_dir}/normalization.pth")
 
-    with open(f"{results_dir}/config.yaml", "w") as f:
-        yaml.dump(vars(cfg), f, default_flow_style=False, allow_unicode=True)
+        # 训练损失
+        np.save(f"{results_dir}/train_losses.npy", np.array(train_losses))
+        np.save(f"{results_dir}/val_losses.npy", np.array(val_losses))
+
+        with open(f"{results_dir}/config.yaml", "w") as f:
+            yaml.dump(vars(cfg), f, default_flow_style=False, allow_unicode=True)
 
 
-    print("All results saved.")
+        print("All results saved.")
 
 
 if __name__ == "__main__":

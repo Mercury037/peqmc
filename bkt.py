@@ -46,47 +46,20 @@ def load_all(results_dir: str, device: str | None = None):
 
     return net, norm, cfg, device
 
+"""
+B是样本量，M是 2^M倍样本量辅助估计，net是函数g，norm是归一化常数，
+cfg是各类参数，nD是路径上时间点个数，T是总时间，method是生成矩阵，rep_seed是重复pemc估计用的随机种子
 
-# ====== 工具：把 theta 四元组堆成 [B,4] ======
-def pack_theta(r, S0, sigma, K):
-    return torch.stack([r, S0, sigma, K], dim=1)
-
-
-def sample_theta_single_with_gen(device="cpu", gen=None):
-    # 返回 0-d 标量 tensor（shape []），后面会被广播
-    r     = 0.01 + (0.03 - 0.01) * torch.rand((), device=device, generator=gen)
-    S0    = 80.0 + (120.0 - 80.0) * torch.rand((), device=device, generator=gen)
-    sigma = 0.05 + (0.25 - 0.05) * torch.rand((), device=device, generator=gen)
-    K     = 90.0 + (110.0 - 90.0) * torch.rand((), device=device, generator=gen)
-    return r, S0, sigma, K
-def theta_scalar_to_batch(theta_scalar, B: int):
-    r, S0, sigma, K = theta_scalar
-    theta_vec = torch.stack([r, S0, sigma, K]).view(1, 4)   # [1,4]
-    return theta_vec.expand(B, 4)                           # [B,4]（不复制内存的视图）
-def _norm_ppf_torch(U: torch.Tensor) -> torch.Tensor:
-    """
-    标准正态的 Phi^{-1}(U)，纯 torch 实现
-    Phi^{-1}(u) = sqrt(2) * erfinv(2u - 1)
-    """
-    eps = torch.finfo(U.dtype).eps
-    U = U.clamp(min=eps, max=1.0 - eps)   # 避免 ppf(0/1) 变成 ±inf
-    return math.sqrt(2.0) * torch.erfinv(2.0 * U - 1.0)
-
-
-    """
-    B是样本量，M是 2^M倍样本量辅助估计，net是函数g，norm是归一化常数，
-    cfg是各类参数，nD是路径上时间点个数，T是总时间，method是生成矩阵，rep_seed是重复pemc估计用的随机种子
-
-    返回：一个标量 PEMC 估计
-    约定：第二项样本量 N2 = (2^M)*B
-    """
+返回：一个标量 PEMC 估计
+约定：第二项样本量 N2 = (2^M)*B
+"""
 
 # ====== 一次 PEMC 估计：只用一个 theta ======
 @torch.no_grad()
 def pemc_estimate(
     B: int, M: int,
     net, norm: dict, cfg,
-    theta,                     # <-- 外面传进来，固定不变
+    theta_1dim,theta_tuple,                     # <-- 外面传进来，固定不变
     nD: int = 256, T: float = 1.0,
     method: str = "pca",
     rep_seed: int = 0,
@@ -101,7 +74,7 @@ def pemc_estimate(
     if N2 & (N2 - 1) != 0:
         raise ValueError(f"N2=(2^M)*B must be a power of 2, got {N2}")
 
-    r, S0, sig, K = theta
+    r, S0, sigma, K = theta_tuple
 
     # =========================
     # term1：1/B sum (f(Y)-g)
@@ -112,14 +85,14 @@ def pemc_estimate(
     # 关键：如果 simulate_gbm_batch_qmc 已经接收 sobol_engine，
     #      尽量别再传 seed/scramble，避免内部覆盖你的 engine
     Z1, W1, S1 = simulate_gbm_batch_qmc(
-        theta, batch_size=B, nD=nD, T=T, device=device, method=method,
+        theta_tuple, nD=nD, T=T, device=device, method=method,
         sobol_engine=sobol_path
     )
 
     X1 = Z1[:, :cfg.dimX]
     y1 = arithmetic_payoff(S1, K)
 
-    theta1_mat = theta_scalar_to_batch(theta, B)   # [B,4]
+    theta1_mat = torch.stack([r,S0,sigma,K],dim= 1)   # [B,4]
     theta1_norm, X1_norm = normalize(theta1_mat, X1, norm_dev)
     g1 = net(theta1_norm, X1_norm)
     term1 = (y1 - g1).mean()
@@ -131,9 +104,9 @@ def pemc_estimate(
                           seed=int(cfg.seed) + 300000 + rep_seed)
 
     U2 = sobol_x.draw(N2).to(device=device, dtype=torch.float32)
-    X2 = _norm_ppf_torch(U2)
+    X2 = inv_Phi_torch(U2)
 
-    theta2_mat = theta_scalar_to_batch(theta, N2)  # ✅ 同一个 theta（也修掉你之前写成 theta1 的坑）
+    theta2_mat = torch.stack(theta_1dim).unsqueeze(0).repeat(N2, 1)   # [B, 4]  # ✅ 同一个 theta（也修掉你之前写成 theta1 的坑）
     theta2_norm, X2_norm = normalize(theta2_mat, X2, norm_dev)
     g2 = net(theta2_norm, X2_norm)
     term2 = g2.mean()
@@ -141,10 +114,10 @@ def pemc_estimate(
     return (term1 + term2).item()
 
 
-def pemc_mean_var(B, M, n_rep, net, norm, cfg, theta, nD=256, T=1.0, method="pca"):
+def pemc_mean_var(B, M, n_rep, net, norm, cfg, theta_1dim,theta_tuple, nD=256, T=1.0, method="pca"):
     est = []
     for rep in range(n_rep):
-        est.append(pemc_estimate(B, M, net, norm, cfg, theta,
+        est.append(pemc_estimate(B, M, net, norm, cfg, theta_1dim=theta_1dim ,theta_tuple=theta_tuple,
                                  nD=nD, T=T, method=method, rep_seed=rep))
     est = np.array(est, dtype=np.float64)
     return {
@@ -184,14 +157,21 @@ def main():
         torch.tensor(0.15, device=device),  # sigma
         torch.tensor(100.0, device=device),  # K
     )
+    r, S0, sigma, K = sample_theta(
+        mode=2,
+        batch_size=cfg.dataset_size,
+        is_same=True,
+        theta_same=theta_fixed,
+        device=device
+    )
 
-    B_list = [128, 256, 512, 1024]
-    M = 4
+    B_list = [128, 256, 512, 1024,2048,4096]
+    M = 12
     n_rep = 100
 
     rows = []
     for B in B_list:
-        out = pemc_mean_var(B, M, n_rep, net, norm, cfg, theta_fixed, nD=256, T=1.0, method="pca")
+        out = pemc_mean_var(B, M, n_rep, net, norm, cfg,theta_1dim=theta_fixed, theta_tuple = (r,S0,sigma,K), nD=256, T=1.0, method="pca")
         rows.append({
             "method": "pca",
             "N1": out["B"],
@@ -205,23 +185,10 @@ def main():
             "sigma": float(theta_fixed[2].item()),
             "K": float(theta_fixed[3].item()),
         })
+        print("B:",B)
 
     df = pd.DataFrame(rows)
-    print(df)
-    # 方差衰减：Var ~ N^{-alpha}
-    alpha = estimate_decay_rate(df, x_col="N1", y_col="var", method="pca")
-    print(alpha)
 
-    # RMSE 衰减：RMSE ~ N^{-beta}
-    beta = estimate_rmse_rate(df, x_col="N1", var_col="var", method="pca")
-    print(beta)
-
-    # 如果你想用总成本当横轴：N_eff = N1 + N2
-    df["N_eff"] = df["N1"] + df["N2"]
-    alpha_eff = estimate_decay_rate(df, x_col="N_eff", y_col="var", method="pca")
-    print(alpha_eff)
-
-    B_list = [128, 256, 512, 1024]
     n_rep = 100
 
     rows = []
@@ -234,7 +201,50 @@ def main():
     df_baseline["S0"] = float(theta_fixed[1].item())
     df_baseline["sigma"] = float(theta_fixed[2].item())
     df_baseline["K"] = float(theta_fixed[3].item())
+
+    pd.set_option("display.float_format", lambda x: f"{x:.12e}")
+    print(df[["N1", "N2", "mean", "var"]].to_string(
+        index=False,
+        formatters={
+            "mean": lambda x: f"{x:.8f}",
+            "var": lambda x: f"{x:.12e}",  # var用科学计数法最稳
+        }
+    ))
+    print(df_baseline[["N1", "N2", "mean", "var"]].to_string(
+        index=False,
+        formatters={
+            "mean": lambda x: f"{x:.8f}",
+            "var": lambda x: f"{x:.12e}",  # var用科学计数法最稳
+        }
+    ))
 import numpy as np
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 import numpy as np
 import pandas as pd
@@ -311,7 +321,7 @@ def qmc_estimate(B, cfg, theta, nD=256, T=1.0, method="pca", rep_seed=0, scrambl
         sob = SobolEngine(dimension=nD, scramble=False)
 
     U = sob.draw(B).to(device=device, dtype=torch.float32)  # [B,nD] in [0,1)
-    Z = _norm_ppf_torch(U)                                  # [B,nD] ~ N(0,1)
+    Z = inv_Phi_torch(U)                                  # [B,nD] ~ N(0,1)
 
     G = _generator_matrix(method, nD=nD, T=T, device=device, dtype=torch.float32)
     W = Z @ G.T

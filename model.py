@@ -85,7 +85,7 @@
 import torch
 import torch.nn as nn
 import torch.functional as F
-from simulation_delete import *
+from simulation_mc import *
 class MLP(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, dropout=0.1):
         super().__init__()
