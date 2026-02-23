@@ -29,8 +29,8 @@ class Config:
         self.seed = 42  # 随机种子
         self.device = "cuda" if torch.cuda.is_available() else "cpu"  # 设备
 
-        self.dimX = 4  # 特征维度
-        self.dataset_size = 2 ** 20  # 样本量
+        self.dimX = 1  # 特征维度
+        self.dataset_size = 2 ** 16  # 样本量
 
         self.train_ratio = 0.7  # 训练集比例
         self.val_ratio = 0.15  # 验证集比例
