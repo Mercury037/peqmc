@@ -1,9 +1,9 @@
-batch_size: 128
-dataset_size: 8192
+batch_size: 512
+dataset_size: 1048576
 device: cpu
-dimX: 16
-dropout: 0.1
-epochs: 100
+dimX: 4
+dropout: 0.3
+epochs: 150
 lr: 0.001
 seed: 42
 train_ratio: 0.7

@@ -6,11 +6,12 @@ import json
 import os
 import random
 import shutil
+import copy  # 新增：用于保存最优参数的深拷贝
 
 from torch.xpu import device
 
 from model import PEMCNet
-from simulation_mc import *
+# from simulation_mc import *
 from simulation_qmc import *
 import yaml
 
@@ -18,34 +19,31 @@ import yaml
 # 获取当前工作目录（CWD）
 current_working_directory = os.getcwd()
 print("CWD =", current_working_directory)
-#保存路径
+# 保存路径
 results_dir = os.path.join(current_working_directory, "results_qmc_pca_mse")
 print("Results directory:", results_dir)
 
 
-
 class Config:
     def __init__(self):
-        self.seed = 42 #随机种子
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"#设备
+        self.seed = 42  # 随机种子
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"  # 设备
 
-        self.dimX = 16  #特征维度
-        self.dataset_size = 2 ** 13 #样本量
+        self.dimX = 4  # 特征维度
+        self.dataset_size = 2 ** 20  # 样本量
 
-        self.train_ratio = 0.7  #训练集比例
-        self.val_ratio = 0.15  #验证集比例
+        self.train_ratio = 0.7  # 训练集比例
+        self.val_ratio = 0.15  # 验证集比例
 
-        self.batch_size = 128   #sgd的batch
-        self.epochs = 100  #进行轮数
+        self.batch_size = 512  # sgd 的 batch
+        self.epochs = 150  # 进行轮数
 
-        self.lr = 1e-3  #初始学习率
-        self.dropout = 0.1
+        self.lr = 1e-3  # 初始学习率
+        self.dropout = 0.3
+
 
 cfg = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-
 
 s = 1
 
@@ -74,15 +72,14 @@ def set_seed(seed):
 #     return TensorDataset(theta, X, PA)
 
 
-def generate_dataset(cfg,theta):
-    # r, S0, sigma, K = sample_theta(mode=2,batch_size=cfg.dataset_size, device=cfg.device)
+def generate_dataset(cfg, theta):
     r, S0, sigma, K = theta
 
-    Z,W,S = simulate_gbm_batch_qmc((r, S0, sigma, K),method="pca", device=cfg.device)
+    Z, W, S = simulate_gbm_batch_qmc((r, S0, sigma, K), method="pca", device=cfg.device)
     PA = arithmetic_payoff(S, K).unsqueeze(1)
     X = features_from_Z(Z, dimX=cfg.dimX)
     theta = torch.stack([r, S0, sigma, K], dim=1)
-    dataset = TensorDataset(theta, X,PA)
+    dataset = TensorDataset(theta, X, PA)
     return dataset
 
 
@@ -122,8 +119,6 @@ def normalize(theta, X, norm):
     return theta, X
 
 
-
-
 # =============================
 # 3️⃣ 训练函数
 # =============================
@@ -136,6 +131,11 @@ def train_model(train_loader, val_loader, norm, cfg):
     train_losses = []
     val_losses = []
     first_step_loss = None
+
+    # ===== 新增：记录最优验证集模型 =====
+    best_val_loss = float("inf")
+    best_epoch = -1
+    best_state_dict = None
 
     for epoch in range(cfg.epochs):
 
@@ -176,7 +176,24 @@ def train_model(train_loader, val_loader, norm, cfg):
         val_loss = val_sum / val_n
         val_losses.append(val_loss)
 
-        print(f"Epoch {epoch+1} | Val Loss: {val_loss:.6f}")
+        # ===== 新增：保存最优参数（按验证集 loss）=====
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1  # 记录为 1-based epoch
+            # 用深拷贝保存参数，避免后续训练覆盖
+            best_state_dict = copy.deepcopy(net.state_dict())
+
+        print(
+            f"Epoch {epoch+1} | Val Loss: {val_loss:.6f}"
+            + ("  <-- best" if (epoch + 1) == best_epoch else "")
+        )
+
+    # ===== 新增：训练结束后恢复到最优参数 =====
+    if best_state_dict is not None:
+        net.load_state_dict(best_state_dict)
+        print(f"\nBest model restored from epoch {best_epoch} | Best Val Loss: {best_val_loss:.6f}")
+    else:
+        print("\nWarning: best_state_dict is None, using last epoch weights.")
 
     return net, first_step_loss, train_losses, val_losses
 
@@ -204,14 +221,12 @@ def evaluate(net, loader, norm, cfg):
     return total / count
 
 
-
-
 def main():
     set_seed(cfg.seed)
     theta = (
-        torch.tensor(0.02, device=cfg.device),  # r
+        torch.tensor(0.02, device=cfg.device),   # r
         torch.tensor(100.0, device=cfg.device),  # S0
-        torch.tensor(0.15, device=cfg.device),  # sigma
+        torch.tensor(0.15, device=cfg.device),   # sigma
         torch.tensor(100.0, device=cfg.device),  # K
     )
     r, S0, sigma, K = sample_theta(
@@ -221,7 +236,8 @@ def main():
         theta_same=theta,
         device=device
     )
-    dataset = generate_dataset(cfg,theta=(r, S0, sigma, K))
+
+    dataset = generate_dataset(cfg, theta=(r, S0, sigma, K))
 
     train_set, val_set, test_set = split_dataset(dataset, cfg)
 
@@ -235,6 +251,7 @@ def main():
         train_loader, val_loader, norm, cfg
     )
 
+    # 注意：这里 evaluate 的 net 已经是“最优验证集参数”恢复后的 net
     test_loss = evaluate(net, test_loader, norm, cfg)
 
     print("Final Test Loss:", test_loss)
@@ -246,7 +263,8 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
-    #保存模型参数 和 norm用训练集估计的均值
+    # 保存模型参数 和 norm用训练集估计的均值
+    # 此时保存的是“最优网络”
     torch.save(net.state_dict(), f"{results_dir}/model.pth")
     torch.save(norm, f"{results_dir}/normalization.pth")
 
@@ -256,7 +274,6 @@ def main():
 
     with open(f"{results_dir}/config.yaml", "w") as f:
         yaml.dump(vars(cfg), f, default_flow_style=False, allow_unicode=True)
-
 
     print("All results saved.")
 

@@ -94,8 +94,9 @@ def pemc_estimate(
 
     theta1_mat = torch.stack([r,S0,sigma,K],dim= 1)   # [B,4]
     theta1_norm, X1_norm = normalize(theta1_mat, X1, norm_dev)
-    g1 = net(theta1_norm, X1_norm)
+    g1 = net(theta1_norm, X1_norm).squeeze(-1)  # [8192]
     term1 = (y1 - g1).mean()
+
 
     # =========================
     # term2：1/N2 sum g(theta, X~)
@@ -112,7 +113,7 @@ def pemc_estimate(
     term2 = g2.mean()
 
     return (term1 + term2).item()
-
+    # return term1
 
 def pemc_mean_var(B, M, n_rep, net, norm, cfg, theta_1dim,theta_tuple, nD=256, T=1.0, method="pca"):
     est = []
@@ -151,26 +152,28 @@ def main():
     print(f"[OK] dimX={getattr(cfg, 'dimX', getattr(cfg, 'dim_x', 16))}, dropout={getattr(cfg, 'dropout', 0.0)}")
 
     # main 里：最外层固定 theta
+
+
+    B_list = [128, 256, 512, 1024,2048,4096,8192]
+    M = 4
+    n_rep = 100
     theta_fixed = (
         torch.tensor(0.02, device=device),  # r
         torch.tensor(100.0, device=device),  # S0
         torch.tensor(0.15, device=device),  # sigma
         torch.tensor(100.0, device=device),  # K
     )
-    r, S0, sigma, K = sample_theta(
-        mode=2,
-        batch_size=cfg.dataset_size,
-        is_same=True,
-        theta_same=theta_fixed,
-        device=device
-    )
 
-    B_list = [128, 256, 512, 1024,2048,4096]
-    M = 12
-    n_rep = 100
 
     rows = []
     for B in B_list:
+        r, S0, sigma, K = sample_theta(
+            mode=2,
+            batch_size=B,
+            is_same=True,
+            theta_same=theta_fixed,
+            device=device
+        )
         out = pemc_mean_var(B, M, n_rep, net, norm, cfg,theta_1dim=theta_fixed, theta_tuple = (r,S0,sigma,K), nD=256, T=1.0, method="pca")
         rows.append({
             "method": "pca",
