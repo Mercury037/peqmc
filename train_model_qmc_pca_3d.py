@@ -31,16 +31,17 @@ class Config:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"#设备
 
         self.dimX = 1#特征维度
-        self.dataset_size = 2 ** 7 #样本量
+        self.dataset_size = 2 ** 16#样本量
 
         self.train_ratio = 0.7  #训练集比例
         self.val_ratio = 0.15  #验证集比例
 
-        self.batch_size = 256  #sgd的batch
-        self.epochs = 300#进行轮数
+        self.batch_size = 512  #sgd的batch
+        self.epochs = 150#进行轮数
 
         self.lr = 1e-3  #初始学习率
-        self.dropout = 0.1
+        self.dropout = 0.3
+
 
         self.rqmc_loss_center = False
         self.rqmc_loss_unbiased = False
@@ -375,7 +376,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ===== 3D 训练配置（你要的版本）=====
-    N_group = 4096           # 每组QMC点数（你指定的 N）
+    N_group = 1024  # 每组QMC点数（你指定的 N）
 
     # ===== 固定一个 theta（你也可以改成 is_same=False 做每组不同theta）=====
     theta_fixed = (
@@ -387,7 +388,8 @@ def main():
 
     # sample_theta(mode=3): 返回每个参数 shape [B_total, N_group]
     r, S0, sigma, K = sample_theta(
-        mode=3,
+        mode=2,
+        batch_size=cfg.dataset_size,
         B=cfg.dataset_size,
         N=N_group,
         is_same=False,          # 固定同一个theta广播到所有组/点

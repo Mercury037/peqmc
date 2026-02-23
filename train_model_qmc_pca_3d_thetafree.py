@@ -26,16 +26,16 @@ class Config:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.dimX = 4
-        self.dataset_size = 2 ** 16   # “组数”B_total（3D模式时）
+        self.dataset_size = 2 ** 20  # “组数”B_total（3D模式时）
 
         self.train_ratio = 0.7
         self.val_ratio = 0.15
 
-        self.batch_size = 256        # DataLoader 的 batch 是“组”
-        self.epochs = 300
+        self.batch_size = 1024        # DataLoader 的 batch 是“组”
+        self.epochs = 150
 
         self.lr = 1e-3
-        self.dropout = 0.1
+        self.dropout = 0
         self.use_bn = False
 
         # ===== 新增：是否使用 theta 作为网络输入 =====

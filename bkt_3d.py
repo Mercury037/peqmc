@@ -373,7 +373,7 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default=os.path.join(os.getcwd(), "results_qmc_pca_mse"),
+        default=os.path.join(os.getcwd(), "results_3d_N10_dim1"),
         help="训练结果目录（默认: CWD/results_qmc_pca_mse）"
     )
     parser.add_argument(
@@ -423,7 +423,7 @@ def main():
     )
 
     B_list = [128, 256, 512, 1024, 2048, 4096, 8192]
-    M = 5
+    M = 4
     n_rep = 100
 
     # ---------- PEMC ----------
