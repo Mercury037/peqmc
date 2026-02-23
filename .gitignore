@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.idea/
+.DS_Store
+
+# training outputs
+results/
+results_*/
+*.pth
+*.pt
+*.npy
+*.npz

@@ -1,8 +1,0 @@
-{
-  "first_step_loss": 143.9139404296875,
-  "best_val_loss": 7.0433484718734105,
-  "best_epoch": 130,
-  "test_loss": 7.009788161630779,
-  "num_train_steps": 13500,
-  "num_epochs": 150
-}
