@@ -1,12 +1,12 @@
 seed: 42
 device: cpu
 dimX: 1
-dataset_size: 65536
+dataset_size: 1024
 train_ratio: 0.7
 val_ratio: 0.15
-batch_size: 512
-epochs: 150
+batch_size: 256
+epochs: 100
 lr: 0.001
-dropout: 0.3
+dropout: 0.1
 rqmc_loss_center: false
 rqmc_loss_unbiased: false

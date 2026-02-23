@@ -406,16 +406,16 @@ def geometric_asian_price_undiscounted(r, S0, sigma, K, nD=252, T=1.0, device="c
     return price
 
 
-# def arithmetic_payoff(S, K):
-#     A = S.mean(dim=-1)
-#     return torch.clamp(A - K, min=0.0) #min下界
-#
+def arithmetic_payoff(S, K):
+    A = S.mean(dim=-1)
+    return torch.clamp(A - K, min=0.0) #min下界
 
-def arithmetic_payoff(S, K, H=105):
-    S_T = S[..., -1]
-    vanilla = torch.clamp(S_T - K, min=0.0)
-    knocked_out = (S >= H).any(dim=-1)
-    return torch.where(knocked_out, torch.zeros_like(vanilla), vanilla)
+
+# def arithmetic_payoff(S, K, H=105):
+#     S_T = S[..., -1]
+#     vanilla = torch.clamp(S_T - K, min=0.0)
+#     knocked_out = (S >= H).any(dim=-1)
+#     return torch.where(knocked_out, torch.zeros_like(vanilla), vanilla)
 
 def lookback_payoff(S, K):
     S_max = S.max(dim=-1).values
