@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-results_dir = "results_qmc_pca_mse"
+results_dir = "results_asian_Xdim1_N20_loss2"
 
 train_losses = np.load(os.path.join(results_dir, "train_losses.npy"))
 val_losses = np.load(os.path.join(results_dir, "val_losses.npy"))

@@ -15,6 +15,7 @@
 import os
 import math
 import argparse
+from random import seed
 from types import SimpleNamespace
 
 import yaml
@@ -373,8 +374,8 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default=os.path.join(os.getcwd(), "results_3d_N10_dim1"),
-        help="训练结果目录（默认: CWD/results_qmc_pca_mse）"
+        default=os.path.join(os.getcwd(), "results_asian_Xdim4_N20_loss2"),
+        help="训练结果目录（默认: CWD/results_asian_Xdim1_N20_loss2）"
     )
     parser.add_argument(
         "--device",
@@ -416,9 +417,9 @@ def main():
 
     # 固定theta（单一合约）
     theta_fixed = (
-        torch.tensor(0.02, device=device),    # r
-        torch.tensor(100.0, device=device),   # S0
-        torch.tensor(0.15, device=device),    # sigma
+        torch.tensor(0.025, device=device),    # r
+        torch.tensor(97.0, device=device),   # S0
+        torch.tensor(0.10, device=device),    # sigma
         torch.tensor(100.0, device=device),   # K
     )
 

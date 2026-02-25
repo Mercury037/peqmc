@@ -8,8 +8,6 @@ import random
 import shutil
 import copy  # 新增：用于保存最优参数的深拷贝
 
-from torch.xpu import device
-
 from model import PEMCNet
 # from simulation_mc import *
 from simulation_qmc import *
@@ -20,23 +18,23 @@ import yaml
 current_working_directory = os.getcwd()
 print("CWD =", current_working_directory)
 # 保存路径
-results_dir = os.path.join(current_working_directory, "results_qmc_pca_mse")
+results_dir = os.path.join(current_working_directory, "results_asian_Xdim16_N20_loss2")
 print("Results directory:", results_dir)
 
 
 class Config:
     def __init__(self):
-        self.seed = 42  # 随机种子
+        self.seed = 43  # 随机种子
         self.device = "cuda" if torch.cuda.is_available() else "cpu"  # 设备
 
         self.dimX = 1  # 特征维度
-        self.dataset_size = 2 ** 16  # 样本量
+        self.dataset_size = 2 ** 20  # 样本量
 
         self.train_ratio = 0.7  # 训练集比例
         self.val_ratio = 0.15  # 验证集比例
 
-        self.batch_size = 512  # sgd 的 batch
-        self.epochs = 150  # 进行轮数
+        self.batch_size = 2048  # sgd 的 batch
+        self.epochs = 50  # 进行轮数
 
         self.lr = 1e-3  # 初始学习率
         self.dropout = 0.3
@@ -75,7 +73,7 @@ def set_seed(seed):
 def generate_dataset(cfg, theta):
     r, S0, sigma, K = theta
 
-    Z, W, S = simulate_gbm_batch_qmc((r, S0, sigma, K), method="pca", device=cfg.device)
+    Z, W, S = simulate_gbm_batch_qmc((r, S0, sigma, K), method="pca", device=cfg.device,seed=cfg.seed)
     PA = arithmetic_payoff(S, K).unsqueeze(1)
     X = features_from_Z(Z, dimX=cfg.dimX)
     theta = torch.stack([r, S0, sigma, K], dim=1)

@@ -167,6 +167,7 @@ def sample_theta(
         "S0":    (80.0, 120.0),
         "sigma": (0.05, 0.25),
         "K":     (90.0, 110.0),
+        # "K": (0.01, 0.02),
     }
 
     # ---------- 固定参数模式：不随机 ----------
@@ -257,9 +258,6 @@ def simulate_gbm_batch_qmc(theta, nD=256, T=1.0, device="cpu", method="pca",
     theta : tuple (r, S0, sigma, K)
         - 情况1：每个参数 shape=[B]
         - 情况2：每个参数 shape=[B, N]
-    batch_size : int
-        - 情况1（dim==1）: 应等于 B
-        - 情况2（dim==2）: 应等于 N（每个 block 的 QMC 点数）
     nD : int
         时间离散维度（也是 QMC 维度）
     T : float
@@ -406,20 +404,36 @@ def geometric_asian_price_undiscounted(r, S0, sigma, K, nD=252, T=1.0, device="c
     return price
 
 
-def arithmetic_payoff(S, K):
-    A = S.mean(dim=-1)
-    return torch.clamp(A - K, min=0.0) #min下界
+# def arithmetic_payoff(S, K):
+#     A = S.mean(dim=-1)
+#     return torch.clamp(A - K, min=0.0) #min下界
 
-
+#障碍
 # def arithmetic_payoff(S, K, H=105):
 #     S_T = S[..., -1]
 #     vanilla = torch.clamp(S_T - K, min=0.0)
 #     knocked_out = (S >= H).any(dim=-1)
 #     return torch.where(knocked_out, torch.zeros_like(vanilla), vanilla)
 
-def lookback_payoff(S, K):
+#回望
+def arithmetic_payoff(S, K):
     S_max = S.max(dim=-1).values
     return torch.clamp(S_max - K, min=0.0)
+#
+# #方差呼唤
+# def arithmetic_payoff(S, K, eps=1e-12):
+#     """
+#     Variance call payoff (unannualized):
+#       ( sum_i (log S_i - log S_{i-1})^2 - K )^+
+#
+#     S: [..., m+1]
+#     return: [...]
+#     """
+#     logS = torch.log(S.clamp_min(eps))
+#     dlogS = logS[..., 1:] - logS[..., :-1]
+#     rv = (dlogS ** 2).sum(dim=-1)
+#     return torch.clamp(rv - K, min=0.0)
+#     # return rv
 
 def geometric_payoff(S, K):
     G = torch.exp(torch.log(S).mean(dim=1))

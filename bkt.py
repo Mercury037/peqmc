@@ -133,8 +133,8 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default=os.path.join(os.getcwd(), "results_qmc_pca_mse"),
-        help="path to the results directory (default: CWD/results_qmc_pca_mse)"
+        default=os.path.join(os.getcwd(), "results_qmc_pca_mse1"),
+        help="path to the results directory (default: CWD/results_asian_Xdim1_N20_loss2)"
     )
     parser.add_argument(
         "--device",

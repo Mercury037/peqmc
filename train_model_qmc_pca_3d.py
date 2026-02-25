@@ -1,17 +1,13 @@
 import torch
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader, random_split
 import numpy as np
 import json
 import os
 import random
 import shutil
-import torch
 import torch.nn.functional as F
-from torch.xpu import device
 
 from model import PEMCNet
-# from simulation_mc import *
 from simulation_qmc import *
 import yaml
 
@@ -20,30 +16,32 @@ import yaml
 current_working_directory = os.getcwd()
 print("CWD =", current_working_directory)
 #保存路径
-results_dir = os.path.join(current_working_directory, "results_qmc_pca_mse")
+results_dir = os.path.join(current_working_directory, "results_asian_Xdim1_N5_loss2_BB")
 print("Results directory:", results_dir)
 
 
 
 class Config:
     def __init__(self):
-        self.seed = 42 #随机种子
+        self.seed = 43 #随机种子
         self.device = "cuda" if torch.cuda.is_available() else "cpu"#设备
-
+        self.method = "pca"
         self.dimX = 1#特征维度
-        self.dataset_size = 2 ** 16#样本量
+        self.dataset_size = 2 ** 6
+#样本量
 
         self.train_ratio = 0.7  #训练集比例
         self.val_ratio = 0.15  #验证集比例
 
-        self.batch_size = 512  #sgd的batch
-        self.epochs = 150#进行轮数
+        self.batch_size = 1024  #sgd的batch
+        self.epochs = 1000#进行轮数
 
         self.lr = 1e-3  #初始学习率
-        self.dropout = 0.3
+        self.dropout = 0.1
 
-
-        self.rqmc_loss_center = False
+        self.thetadim = 2
+        self.N = 2048
+        self.rqmc_loss_center = True
         self.rqmc_loss_unbiased = False
 
 cfg = Config()
@@ -78,7 +76,7 @@ def generate_dataset(cfg, theta):
     """
     r, S0, sigma, K = theta
 
-    Z, W, S = simulate_gbm_batch_qmc((r, S0, sigma, K), method="pca", device=cfg.device)
+    Z, W, S = simulate_gbm_batch_qmc((r, S0, sigma, K), method=cfg.method, device=cfg.device,seed=cfg.seed)
     PA = arithmetic_payoff(S, K).unsqueeze(-1)   # 2D->[M,1], 3D->[B,N,1]
     X = features_from_Z(Z, dimX=cfg.dimX)
 
@@ -207,6 +205,9 @@ def _batch_loss_auto(pred, y, X, cfg, for_eval=False):
     else:
         raise ValueError(f"不支持的 X 维度: {X.ndim}，期望 2 或 3")
 
+import torch
+
+
 def rqmc_group_var_loss(
     pred: torch.Tensor,
     y: torch.Tensor,
@@ -216,22 +217,29 @@ def rqmc_group_var_loss(
     return_stats: bool = False,
 ):
     """
-    pred: [B,N,1] 或 [B,N]
-    y:    [B,N,1] 或 [B,N]
+    pred: [B, N, 1] 或 [B, N]
+    y:    [B, N, 1] 或 [B, N]
 
     center=True:
         loss = 方差版本（推荐）
-              ~= Var_b( mean_i (y_{b,i}-pred_{b,i}) )
+             ~= Var_b( mean_i (y_{b,i} - pred_{b,i}) )
 
     center=False:
         loss = 二阶矩版本
-              = E_b[ hbar_b^2 ] = Var(hbar) + (E[hbar])^2
+             = E_b[hbar_b^2]
+             = Var(hbar) + (E[hbar])^2
 
     unbiased:
         仅在 center=True 且想用样本方差(B-1)时生效。
         一般训练里用 unbiased=False 更稳（除以B）。
+
+    keepdim_last:
+        兼容参数（当前实现里不影响计算逻辑，保留接口以便后续扩展）
+
+    return_stats:
+        True 时返回 (loss, stats)
     """
-    # 统一成 [B,N,1]
+    # 统一成 [B, N, 1]
     if pred.ndim == 2:
         pred = pred.unsqueeze(-1)
     if y.ndim == 2:
@@ -244,10 +252,10 @@ def rqmc_group_var_loss(
     assert C == 1, f"目前按标量输出写的，最后一维应为1，got {C}"
 
     # h = y - g
-    h = y - pred                 # [B,N,1]
+    h = y - pred  # [B, N, 1]
 
-    # 每组沿 N 求均值 -> [B,1]
-    hbar = h.mean(dim=1)         # [B,1]
+    # 每组沿 N 求均值 -> [B, 1]
+    hbar = h.mean(dim=1)  # [B, 1]
 
     if center:
         if unbiased:
@@ -376,7 +384,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ===== 3D 训练配置（你要的版本）=====
-    N_group = 1024  # 每组QMC点数（你指定的 N）
+    N_group = cfg.N # 每组QMC点数（你指定的 N）
 
     # ===== 固定一个 theta（你也可以改成 is_same=False 做每组不同theta）=====
     theta_fixed = (
@@ -388,7 +396,7 @@ def main():
 
     # sample_theta(mode=3): 返回每个参数 shape [B_total, N_group]
     r, S0, sigma, K = sample_theta(
-        mode=2,
+        mode=cfg.thetadim,
         batch_size=cfg.dataset_size,
         B=cfg.dataset_size,
         N=N_group,
@@ -431,6 +439,8 @@ def main():
     print("First step loss:", first_step_loss)
     print(f"Best Val Loss: {best_val_loss:.6f} (epoch {best_epoch})")
     print("Final Test Loss (using best-val checkpoint):", test_loss)
+
+
 
     # ===== 保存 =====
     # 不要先 rmtree；避免后续保存失败时目录被删空
