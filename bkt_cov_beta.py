@@ -257,13 +257,13 @@ def pemc_estimate(
     net,
     norm: dict,
     cfg,
-    theta_1dim,          # 固定theta（4个标量tuple），给 term2 用
+    theta_1dim,          # 固定theta（4个标量tensor），给 term2 用
     theta_tuple,         # 每个参数 shape [B]，给 term1 用
     nD: int = 256,
     T: float = 1.0,
     method: str = "pca",
     rep_seed: int = 0,
-    beta: float = 1.0,   # <<< 新增：对应当前B的beta
+    beta: float = 1.0,
     return_components: bool = False,
 ):
     device = cfg.device
@@ -278,7 +278,11 @@ def pemc_estimate(
 
     beta = float(beta)
 
-    r, S0, sigma, K = theta_tuple  # [B]
+    # term1 theta: shape [B]
+    r, S0, sigma, K = theta_tuple
+
+    # 统一生成矩阵（不要硬编码256；生成一次即可）
+    G = generator_matrix(method, nD=256, T=1, device=device, dtype=torch.float32)
 
     # -------------------------
     # term1 = (1/B) sum_i [ f_i - beta * g_i ]
@@ -297,8 +301,19 @@ def pemc_estimate(
         sobol_engine=sobol_path
     )
 
-    X1 = Z1[:, :cfg.dimX]              # [B, dimX]
-    y1 = arithmetic_payoff(S1, K)      # [B]
+    X1 = features_from_Z_barrier(
+        Z1,
+        dimX=cfg.dimX,
+        theta=(r, S0, sigma, K),  # 至少前3个会用到
+        G=G,
+        T=1.0,
+        H=105.0,  # 你的障碍价，按实际改
+        use_z_combos=True,  # 是否加少量 Z 组合特征
+        z_combo_max=3,  # 最多几个组合特征（建议 2~4）
+        near_ratio=0.98,  # 预警线 alpha*H
+        near_band=2.0,  # 近障碍带宽（价格单位）
+    )
+    y1 = arithmetic_payoff(S1, K, S0)  # [B]
 
     theta1_mat = torch.stack([r, S0, sigma, K], dim=-1)   # [B,4]
     g1 = predict_g_points_adaptive(net, norm_dev, cfg, theta1_mat, X1)  # [B]
@@ -309,19 +324,47 @@ def pemc_estimate(
 
     # -------------------------
     # term2 = beta * (1/N2) sum_j g(theta_fixed, X~_j)
+    # 注意：X~_j 现在依赖路径，所以必须先模拟路径再构造特征
     # -------------------------
-    sobol_x = SobolEngine(
-        dimension=cfg.dimX,
+    r_fix, S0_fix, sigma_fix, K_fix = theta_1dim  # 标量tensor（0-dim）
+
+    # 显式构造 shape=[N2] 的固定参数（避免广播/shape坑）
+    r2 = torch.full((N2,), float(r_fix.item()), device=device, dtype=torch.float32)
+    S02 = torch.full((N2,), float(S0_fix.item()), device=device, dtype=torch.float32)
+    sigma2 = torch.full((N2,), float(sigma_fix.item()), device=device, dtype=torch.float32)
+    K2 = torch.full((N2,), float(K_fix.item()), device=device, dtype=torch.float32)
+    theta2_tuple = (r2, S02, sigma2, K2)  # ✅ shape=[N2]
+
+    sobol_path2 = SobolEngine(
+        dimension=nD,
         scramble=True,
         seed=int(cfg.seed) + 300000 + rep_seed
     )
-    U2 = sobol_x.draw(N2).to(device=device, dtype=torch.float32)  # [N2, dimX]
-    X2 = inv_Phi_torch(U2)                                         # [N2, dimX]
 
-    theta2_row = torch.stack(list(theta_1dim), dim=0).to(device=device, dtype=torch.float32)  # [4]
-    theta2_mat = theta2_row.unsqueeze(0).expand(N2, 4)  # [N2,4]
+    Z2, W2, S2 = simulate_gbm_batch_qmc(
+        theta2_tuple,
+        nD=nD, T=T,
+        device=device,
+        method=method,
+        sobol_engine=sobol_path2
+    )
 
+    X2 = features_from_Z_barrier(
+        Z2,
+        dimX=cfg.dimX,
+        theta=theta2_tuple,  # 至少前3个会用到
+        G=G,
+        T=1.0,
+        H=105.0,  # 你的障碍价，按实际改
+        use_z_combos=True,  # 是否加少量 Z 组合特征
+        z_combo_max=3,  # 最多几个组合特征（建议 2~4）
+        near_ratio=0.98,  # 预警线 alpha*H
+        near_band=2.0,  # 近障碍带宽（价格单位）
+    )
+
+    theta2_mat = torch.stack([r2, S02, sigma2, K2], dim=-1)  # [N2,4]
     g2 = predict_g_points_adaptive(net, norm_dev, cfg, theta2_mat, X2)  # [N2]
+
     g2bar = g2.mean()
     term2 = beta * g2bar
 
@@ -339,7 +382,6 @@ def pemc_estimate(
         "g1bar": float(g1bar.item()),
         "g2bar": float(g2bar.item()),
     }
-
 
 def pemc_mean_var(
     B: int,
@@ -514,7 +556,7 @@ def mc_estimate(B, cfg, theta, nD=256, T=1.0, method="pca", rep_seed=0):
     t = torch.linspace(T / nD, T, nD, device=device, dtype=torch.float32).view(1, nD)
     S = S0 * torch.exp((r - 0.5 * sigma * sigma) * t + sigma * W)
 
-    y = arithmetic_payoff(S, K)
+    y = arithmetic_payoff(S, K,S0)
     return float(y.mean().item())
 
 
@@ -557,7 +599,7 @@ def qmc_estimate(B, cfg, theta, nD=256, T=1.0, method="pca", rep_seed=0, scrambl
     t = torch.linspace(T / nD, T, nD, device=device, dtype=torch.float32).view(1, nD)
     S = S0 * torch.exp((r - 0.5 * sigma * sigma) * t + sigma * W)
 
-    y = arithmetic_payoff(S, K)
+    y = arithmetic_payoff(S, K,S0)
     return float(y.mean().item())
 
 
@@ -586,7 +628,7 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default=os.path.join(os.getcwd(), "results_lookback_Xdim1_N6_loss2"),
+        default=os.path.join(os.getcwd(), "results_barrier_try"),
         help="训练结果目录"
     )
     parser.add_argument(
@@ -674,8 +716,8 @@ def main():
     )
 
     B_list = [128, 256, 512, 1024, 2048, 4096, 8192]
-    M = args.M
-    n_rep = args.n_rep
+    M = 0
+    n_rep = 200
 
     # ---------- PEMC（含方差分解，带beta） ----------
     rows_pemc = []

@@ -226,6 +226,87 @@ def sample_theta(
     return r, S0, sigma, K
 
 
+import torch
+from torch.quasirandom import SobolEngine
+
+@torch.no_grad()
+def fit_gpca_rotation_weighted(
+    *,
+    nD: int,
+    T: float,
+    theta_fixed,            # (r, S0, sigma, K) 标量
+    H: float = 105.0,
+    base_method: str = "pca",
+    M: int = 8192,          # 用多少样本拟合 R
+    scramble: bool = True,
+    seed: int = 123,
+    weight_mode: str = "var",   # "var" | "abs" | "sq"
+    tau_barrier: float = 1.5,   # smooth barrier 的温度（越小越接近硬障碍）
+    device: str = "cpu",
+):
+    """
+    返回:
+      R: [nD, nD] 正交矩阵（列向量为“重要方向”，已按重要性降序）
+    """
+    dtype_work = torch.float64  # 拟合时用64更稳
+    # 1) 采样 Z0 ~ N(0,I)（QMC）
+    eng = SobolEngine(dimension=nD, scramble=scramble, seed=seed)
+    U = eng.draw(M).to(device=device, dtype=torch.float32)
+    Z0 = inv_Phi_torch(U).to(device=device, dtype=dtype_work)   # [M,nD]
+
+    # 2) base 生成矩阵（例如 PCA）
+    G_base = generator_matrix(base_method, nD=nD, T=T, device=device, dtype=dtype_work)  # [nD,nD]
+
+    # 3) 用 base 路径算一个“平滑 barrier KO call” proxy payoff
+    r, S0, sigma, K = theta_fixed
+    r     = torch.as_tensor(r, device=device, dtype=dtype_work)
+    S0    = torch.as_tensor(S0, device=device, dtype=dtype_work)
+    sigma = torch.as_tensor(sigma, device=device, dtype=dtype_work)
+    K     = torch.as_tensor(K, device=device, dtype=dtype_work)
+    Ht    = torch.as_tensor(H, device=device, dtype=dtype_work)
+
+    dt = T / nD
+    t = torch.arange(1, nD + 1, device=device, dtype=dtype_work) * dt  # [nD]
+
+    W = Z0 @ G_base.T  # [M,nD]
+    logS = torch.log(S0) + (r - 0.5 * sigma**2) * t + sigma * W
+    S = torch.exp(logS)  # [M,nD]
+
+    S_T = S[:, -1]
+    vanilla = torch.clamp(S_T - K, min=0.0)
+
+    # barrier: not_hit ≈ 1{max<S<H} 用 sigmoid 平滑一下
+    S_max = S.max(dim=-1).values
+    not_hit = torch.sigmoid((Ht - S_max) / tau_barrier)   # [M]
+    y = vanilla * not_hit                                  # [M]
+
+    # 4) 权重 w
+    if weight_mode == "var":
+        yc = y - y.mean()
+        w = yc**2
+    elif weight_mode == "abs":
+        w = y.abs()
+    elif weight_mode == "sq":
+        w = y**2
+    else:
+        raise ValueError("weight_mode must be in {'var','abs','sq'}")
+
+    w = w / (w.mean() + 1e-12)
+
+    # 5) 加权协方差 Σ = E[w Z Z^T]
+    # （Z0 均值本来就≈0，这里不强制中心化也行；中心化更稳）
+    Zc = Z0 - Z0.mean(dim=0, keepdim=True)  # [M,nD]
+    Sigma = (Zc.T * w.unsqueeze(0)) @ Zc / Zc.shape[0]     # [nD,nD]
+    Sigma = 0.5 * (Sigma + Sigma.T)
+
+    # 6) 特征分解 -> R（列向量按重要性降序）
+    evals, evecs = torch.linalg.eigh(Sigma)  # 升序
+    idx = torch.argsort(evals, descending=True)
+    R = evecs[:, idx]                        # [nD,nD] 正交
+    return R.to(dtype=torch.float32)
+
+
+
 def draw_Z_block_qmc(num_points, nD, device="cpu", *,
                       scramble=True, seed=42, block_idx=0,
                       sobol_engine=None, dtype=torch.float32):

@@ -20,28 +20,30 @@ from simulation_qmc import *
 class Config:
     def __init__(self):
         # ===== Reproducibility / Device =====
-        self.results_dir_name = "results_lookback_Xdim1_N6_loss2"
+        self.results_dir_name = "results_barrier_try"
 
         self.seed = 44
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # ===== Simulation / Feature =====
         self.method = "pca"      # 路径构造方法（示例：pca / bb / cholesky）
-        self.dimX = 4      # 特征维度（从Z截断）
+        self.dimX = 46  # 特征维度（从Z截断）
         self.thetadim = 2       # 2 或 3（传给 sample_theta 的 mode）
         self.N = 128           # 训练数据中每组QMC点数（仅训练/数据生成用，不等于beta曲线中的N）
 
         # ===== Dataset =====
-        self.dataset_size = 2 ** 16  # 3D模式下表示“组数B_total”
+        self.dataset_size = 2 ** 16 # 3D模式下表示“组数B_total”
         self.train_ratio = 0.7
         self.val_ratio = 0.15
 
         # ===== Training =====
         self.batch_size = 512   # 3D模式下单位是“组数”
-        self.epochs = 200
+        self.epochs = 50
         self.lr = 1e-3
         self.dropout = 0.3
-
+        self.nD = 256
+        self.T = 1
+        self.H = 105
         # ===== Loss (RQMC group loss) =====
         self.rqmc_loss_center = True
         self.rqmc_loss_unbiased = False
@@ -121,8 +123,22 @@ def generate_dataset(cfg, theta):
         device=cfg.device,
         seed=cfg.seed
     )
-    PA = arithmetic_payoff(S, K).unsqueeze(-1)   # 2D->[M,1], 3D->[B,N,1]
-    X = features_from_Z(Z, dimX=cfg.dimX)
+    PA = arithmetic_payoff(S, K, S0).unsqueeze(-1)   # 2D->[M,1], 3D->[B,N,1]
+    # X = features_from_Z(Z,S, dimX=cfg.dimX)
+    G = generator_matrix(cfg.method, nD=256, T=cfg.T, device=cfg.device, dtype=torch.float32)
+
+    X = features_from_Z_barrier(
+        Z,
+        dimX=cfg.dimX,
+        theta=(r, S0, sigma, K),  # 至少前3个会用到
+        G=G,
+        T=1.0,
+        H=105.0,  # 你的障碍价，按实际改
+        use_z_combos=True,  # 是否加少量 Z 组合特征
+        z_combo_max=3,  # 最多几个组合特征（建议 2~4）
+        near_ratio=0.98,  # 预警线 alpha*H
+        near_band=2.0,  # 近障碍带宽（价格单位）
+    )
 
     # 关键：dim=-1 才能同时兼容 2D/3D
     theta_tensor = torch.stack([r, S0, sigma, K], dim=-1)
