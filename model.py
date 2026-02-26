@@ -333,7 +333,6 @@ class PEMCNet(nn.Module):
         if X.ndim == 2:
             # 点模式
             M, d = X.shape
-            assert d == self.dimX, f"X.shape={X.shape}, 最后一维应为 dimX={self.dimX}"
 
             if theta.ndim == 1:
                 assert theta.shape[0] == 4, f"theta若为1维，应是[4]，got {theta.shape}"

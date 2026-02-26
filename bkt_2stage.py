@@ -2,6 +2,7 @@
 # 兼容：
 #   - 旧模型：2D训练（MSE），测试时 net(theta:[N,4], X:[N,d])
 #   - 新模型：3D训练（RQMC group loss），测试时自动包装成 [1,N,*] 再过 net
+#   - 二阶段训练版：支持加载 stage1 / stage2 / final 模型与 normalization
 #
 # 功能：
 #   1) 测 PEMC / MC / QMC 的 mean / var
@@ -20,7 +21,6 @@
 #   simulation_qmc.py:
 #       sample_theta, simulate_gbm_batch_qmc, inv_Phi_torch,
 #       arithmetic_payoff, Cholesky/PCA/BB, features_from_Z
-#   train_model_qmc_pca_3d_beta.py: normalize（或你自己的训练脚本名）
 #   model.py: PEMCNet
 
 import os
@@ -37,12 +37,24 @@ from torch.quasirandom import SobolEngine
 
 from simulation_qmc import *
 from model import PEMCNet
-# 这里按你的当前文件名改；如果你的训练脚本叫 train_model_qmc_pca_3d.py，就改回去
-from train_model_qmc_pca_3d_beta import normalize
 
 
 # ============================================================
-# 1) 加载训练结果
+# 0.5) 本地 normalize（与训练脚本一致，避免依赖训练文件名）
+# ============================================================
+def normalize(theta, X, norm):
+    """
+    与训练脚本保持一致：
+      theta: [N,4] 或 [1,N,4] 或 [B,N,4]
+      X:     [N,d] 或 [1,N,d] 或 [B,N,d]
+    """
+    theta = (theta - norm["theta_mean"]) / norm["theta_std"]
+    X = (X - norm["X_mean"]) / norm["X_std"]
+    return theta, X
+
+
+# ============================================================
+# 1) 加载训练结果（支持二阶段训练产物）
 # ============================================================
 def _load_cfg(cfg_path: str):
     if not os.path.exists(cfg_path):
@@ -52,11 +64,69 @@ def _load_cfg(cfg_path: str):
     return SimpleNamespace(**d)
 
 
-def load_all(results_dir: str, device: str | None = None):
+def _pick_model_and_norm_paths(
+    results_dir: str,
+    eval_stage: str = "final",
+    model_name: str | None = None,
+    norm_name: str | None = None,
+):
+    """
+    二阶段训练产物兼容：
+      - final  : model.pth + normalization.pth
+      - stage1 : model_stage1_best.pth + normalization_stage1.pth
+      - stage2 : 优先 model.pth / normalization_stage2.pth；不存在再回退 normalization.pth
+
+    也支持手动覆盖：
+      --model_name xxx.pth
+      --norm_name  xxx.pth
+    """
     results_dir = os.path.abspath(results_dir)
 
-    model_path = os.path.join(results_dir, "model.pth")
-    norm_path = os.path.join(results_dir, "normalization.pth")
+    # model path
+    if model_name is not None:
+        model_path = os.path.join(results_dir, model_name)
+    else:
+        if eval_stage == "stage1":
+            model_path = os.path.join(results_dir, "model_stage1_best.pth")
+        elif eval_stage in ("stage2", "final"):
+            # 二阶段训练脚本通常把 stage2 best 存为 model.pth
+            model_path = os.path.join(results_dir, "model.pth")
+        else:
+            raise ValueError(f"Unknown eval_stage: {eval_stage}")
+
+    # norm path
+    if norm_name is not None:
+        norm_path = os.path.join(results_dir, norm_name)
+    else:
+        if eval_stage == "stage1":
+            norm_path = os.path.join(results_dir, "normalization_stage1.pth")
+        elif eval_stage == "stage2":
+            norm_stage2 = os.path.join(results_dir, "normalization_stage2.pth")
+            norm_final = os.path.join(results_dir, "normalization.pth")
+            norm_path = norm_stage2 if os.path.exists(norm_stage2) else norm_final
+        elif eval_stage == "final":
+            norm_path = os.path.join(results_dir, "normalization.pth")
+        else:
+            raise ValueError(f"Unknown eval_stage: {eval_stage}")
+
+    return model_path, norm_path
+
+
+def load_all(
+    results_dir: str,
+    device: str | None = None,
+    eval_stage: str = "final",
+    model_name: str | None = None,
+    norm_name: str | None = None,
+):
+    results_dir = os.path.abspath(results_dir)
+
+    model_path, norm_path = _pick_model_and_norm_paths(
+        results_dir=results_dir,
+        eval_stage=eval_stage,
+        model_name=model_name,
+        norm_name=norm_name,
+    )
     cfg_path = os.path.join(results_dir, "config.yaml")
 
     if not os.path.exists(model_path):
@@ -93,7 +163,7 @@ def load_all(results_dir: str, device: str | None = None):
 
     norm = torch.load(norm_path, map_location=device)
     cfg.device = device
-    return net, norm, cfg, device
+    return net, norm, cfg, device, model_path, norm_path
 
 
 # ============================================================
@@ -444,8 +514,8 @@ def pemc_mean_var(
     nD: int = 256,
     T: float = 1.0,
     method: str = "pca",
-    beta_mode: str = "rep_term1",   # <<< 默认用rep-level term1最优beta
-    beta_file: float | None = None, # <<< file模式或对照用
+    beta_mode: str = "rep_term1",   # 默认用rep-level term1最优beta
+    beta_file: float | None = None, # file模式或对照用
     return_rep_df: bool = False,
 ):
     """
@@ -527,7 +597,7 @@ def pemc_mean_var(
     )
     var_t1_recon_err = (var_t1 - var_t1_recon) if np.isfinite(var_t1) and np.isfinite(var_t1_recon) else float("nan")
 
-    # 你关心的诊断：若 beta = Cov/Var(g1bar)，则 ratio 应接近 1-rho^2
+    # 诊断：若 beta = Cov/Var(g1bar)，则 ratio 应接近 1-rho^2
     vr_term1_vs_ybar = float(var_t1 / var_ybar) if np.isfinite(var_t1) and np.isfinite(var_ybar) and abs(var_ybar) > 0 else float("nan")
     one_minus_rho2 = float(1.0 - corr_ybar_g1bar ** 2) if np.isfinite(corr_ybar_g1bar) else float("nan")
     vr_gap = float(vr_term1_vs_ybar - one_minus_rho2) if np.isfinite(vr_term1_vs_ybar) and np.isfinite(one_minus_rho2) else float("nan")
@@ -586,7 +656,7 @@ def pemc_mean_var(
         "var_term1_recon": float(var_t1_recon),
         "var_term1_recon_err": float(var_t1_recon_err),
 
-        # 关键诊断（你关心的）
+        # 关键诊断
         "vr_term1_vs_ybar": float(vr_term1_vs_ybar),
         "one_minus_rho2": float(one_minus_rho2),
         "vr_gap_term1_vs_1mrho2": float(vr_gap),
@@ -696,7 +766,7 @@ def qmc_estimate(B, cfg, theta, nD=256, T=1.0, method="pca", rep_seed=0, scrambl
         sob = SobolEngine(
             dimension=nD,
             scramble=True,
-            seed=seed0 + 200000 + rep_seed   # <<< 与 pemc term1 同 seed 规则
+            seed=seed0 + 200000 + rep_seed   # 与 pemc term1 同 seed 规则
         )
     else:
         sob = SobolEngine(dimension=nD, scramble=False)
@@ -739,7 +809,7 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default=os.path.join(os.getcwd(), "results_lookback_Xdim26_N20_loss2"),
+        default=os.path.join(os.getcwd(), "results_lookback_two_stage"),
         help="训练结果目录"
     )
     parser.add_argument(
@@ -748,6 +818,28 @@ def main():
         default=None,
         help="cpu / cuda / cuda:0 ..."
     )
+
+    # 新增：二阶段模型选择
+    parser.add_argument(
+        "--eval_stage",
+        type=str,
+        default="final",
+        choices=["final", "stage1", "stage2"],
+        help="加载哪个阶段的模型/归一化：final / stage1 / stage2"
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=None,
+        help="手动指定模型文件名（优先级高于 --eval_stage），例如 model_stage1_best.pth"
+    )
+    parser.add_argument(
+        "--norm_name",
+        type=str,
+        default=None,
+        help="手动指定归一化文件名（优先级高于 --eval_stage），例如 normalization_stage1.pth"
+    )
+
     parser.add_argument(
         "--method",
         type=str,
@@ -800,7 +892,13 @@ def main():
     )
     args = parser.parse_args()
 
-    net, norm, cfg, device = load_all(args.results_dir, args.device)
+    net, norm, cfg, device, loaded_model_path, loaded_norm_path = load_all(
+        args.results_dir,
+        device=args.device,
+        eval_stage=args.eval_stage,
+        model_name=args.model_name,
+        norm_name=args.norm_name,
+    )
 
     # beta map（用于 file 模式，或作为对照打印）
     beta_map = load_beta_map(args.results_dir)
@@ -808,8 +906,9 @@ def main():
     # method选择：默认跟训练配置走；若显式给 --use_cli_method 则用命令行
     eval_method = args.method if args.use_cli_method else getattr(cfg, "method", args.method)
 
-    print(f"[OK] Loaded net         : {os.path.join(os.path.abspath(args.results_dir), 'model.pth')}")
-    print(f"[OK] Loaded norm        : {os.path.join(os.path.abspath(args.results_dir), 'normalization.pth')}")
+    print(f"[OK] Loaded net         : {loaded_model_path}")
+    print(f"[OK] Loaded norm        : {loaded_norm_path}")
+    print(f"[OK] eval_stage         : {args.eval_stage}")
     print(f"[OK] Device             : {device}")
     print(f"[OK] dimX               : {getattr(cfg, 'dimX', None)}")
     print(f"[OK] dropout            : {getattr(cfg, 'dropout', None)}")
@@ -925,11 +1024,14 @@ def main():
         })
 
         rep_parts_all.append(rep_df)
+        beta_file_val = out["beta_file"]
+        beta_file_str = f"{beta_file_val:.8f}" if np.isfinite(beta_file_val) else "nan"
+
         print(
             f"[PEMC] done B={B:5d} | "
             f"beta_mode={args.beta_mode} | "
             f"beta_used={out['beta']:.8f} | "
-            f"beta_file={out['beta_file'] if np.isfinite(out['beta_file']) else float('nan'):.8f} | "
+            f"beta_file={beta_file_str} | "
             f"beta_rep_term1*={out['beta_rep_term1_star']:.8f} | "
             f"corr(ybar,g1bar)={out['corr_ybar_g1bar']:.6f}"
         )
@@ -1053,16 +1155,22 @@ def main():
 
     # ---------- 保存 ----------
     out_dir = os.path.abspath(args.results_dir)
-    df_pemc.to_csv(os.path.join(out_dir, "eval_pemc_with_decomp.csv"), index=False)
-    df_base.to_csv(os.path.join(out_dir, "eval_baselines.csv"), index=False)
+
+    # 文件名带 stage 标记，避免你跑 stage1/stage2 时互相覆盖
+    suffix = f"_{args.eval_stage}"
+    if args.model_name is not None or args.norm_name is not None:
+        suffix += "_custom"
+
+    df_pemc.to_csv(os.path.join(out_dir, f"eval_pemc_with_decomp{suffix}.csv"), index=False)
+    df_base.to_csv(os.path.join(out_dir, f"eval_baselines{suffix}.csv"), index=False)
     if not df_pemc_rep.empty:
-        df_pemc_rep.to_csv(os.path.join(out_dir, "eval_pemc_rep_components.csv"), index=False)
+        df_pemc_rep.to_csv(os.path.join(out_dir, f"eval_pemc_rep_components{suffix}.csv"), index=False)
 
     print(f"\n[OK] Saved CSVs to {out_dir}")
-    print("[OK] - eval_pemc_with_decomp.csv")
-    print("[OK] - eval_baselines.csv")
+    print(f"[OK] - eval_pemc_with_decomp{suffix}.csv")
+    print(f"[OK] - eval_baselines{suffix}.csv")
     if not df_pemc_rep.empty:
-        print("[OK] - eval_pemc_rep_components.csv")
+        print(f"[OK] - eval_pemc_rep_components{suffix}.csv")
 
 
 if __name__ == "__main__":

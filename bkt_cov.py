@@ -489,7 +489,7 @@ def main():
     parser.add_argument(
         "--results_dir",
         type=str,
-        default=os.path.join(os.getcwd(), "results_lookback_Xdim1_N6_loss2"),
+        default=os.path.join(os.getcwd(), "results_lookback_Xdim17_N20_loss2"),
         help="训练结果目录"
     )
     parser.add_argument(
