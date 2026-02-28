@@ -25,7 +25,10 @@ class Config:
 
         # ===== Simulation / Feature =====
         self.method = "pca"       # pca / bb / cholesky
-        self.dimX = 26      # 特征维度
+        self.dimX = 6  # 特征维度
+        self.dimZ = 4
+        self.dimProxy = 2
+
         self.thetadim = 2      # 2 或 3（训练数据模式）
         self.N = 2048              # 训练数据中每组QMC点数（仅训练/数据生成用）
 
@@ -53,7 +56,7 @@ class Config:
         self.beta_N_list = [128, 256, 512, 1024, 2048, 4096, 8192]
         self.beta_num_reps = 2 ** 7
         self.beta_rep_seed_base = 100000  # beta评估用的基础seed（避免和训练共用）
-
+        self.nrep_beta = 100
 
 # =============================
 # 1) Utility
@@ -124,16 +127,15 @@ def generate_dataset(cfg, theta, seed=None):
     # lookback payoff（精简版 arithmetic_payoff 不需要 S0）
     y = arithmetic_payoff(S, K).unsqueeze(-1)  # 2D->[M,1], 3D->[B,N,1]
 
-    # 精简版 features_from_Z（只保留 minmax）
-    X = features_from_Z(
-        Z,
+    X = features_from_Z_lookback(
+        Z=Z,
         dimX=cfg.dimX,
-        theta=(r, S0, sigma, K),
+        dimZ=cfg.dimZ,
+        dimProxy=cfg.dimProxy,
+        theta = (r, S0, sigma, K),         # (r, S0, sigma, K)
         G=G,
-        T=cfg.T,
-        # k_proxy=8,   # 可选：不传则默认 max(dimX-2,1)
-    )
-
+        k_proxy=64,
+        )
     # dim=-1 同时兼容 2D/3D
     theta_tensor = torch.stack([r, S0, sigma, K], dim=-1)
 
@@ -381,13 +383,12 @@ def evaluate(net, loader, norm, cfg):
 
 
 
-
-
-
-
-
+import copy
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 # =============================
-# 5) Beta statistics (rep-loop mode)
+# 5) Beta statistics (numpy)
 # =============================
 def _np_sample_var(x):
     x = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -420,158 +421,169 @@ def _np_sample_corr(x, y, eps=1e-30):
     return float(_np_sample_cov(x, y) / den)
 
 
+# =============================
+# helper: collect (ybar, gbar) pairs from a 3D dataset
+# =============================
 @torch.no_grad()
-def _compute_ybar_gbar_one_rep(net, norm, cfg, theta_fixed, N_group, rep_seed):
+def collect_ybar_gbar_pairs(net, dataset: TensorDataset, norm: dict, cfg, loader_batch_size=None):
     """
-    单个 rep:
-      - 固定 theta
-      - 生成 1 组 [1,N,*] fresh RQMC/QMC 数据
-      - 返回该 rep 的 (ybar, gbar)
+    dataset: TensorDataset(theta, X, y), 且应为3D样本:
+      theta [B,N,4], X [B,N,d], y [B,N,1]   (或 y [B,N])
+    返回:
+      ybar_all: np.ndarray [B_total]
+      gbar_all: np.ndarray [B_total]
     """
+    if loader_batch_size is None:
+        loader_batch_size = min(256, len(dataset)) if len(dataset) > 0 else 1
+
+    loader = DataLoader(dataset, batch_size=loader_batch_size, shuffle=False)
     net.eval()
 
-    # 固定theta，广播到 [1,N]
-    r, S0, sigma, K = sample_theta(
-        mode=3,
-        B=1,
-        N=int(N_group),
-        is_same=True,
-        theta_same=theta_fixed,
-        device=cfg.device
-    )
+    ybar_all = []
+    gbar_all = []
 
-    # 用 rep_seed 保证每个 rep 都是 fresh 随机化（RQMC）
-    Z, W, S, G = simulate_gbm_batch_qmc(
-        (r, S0, sigma, K),
-        nD=cfg.nD,
-        T=cfg.T,
-        method=cfg.method,
-        device=cfg.device,
-        seed=int(rep_seed)
-    )
+    for theta, X, y in loader:
+        theta = theta.to(cfg.device)
+        X = X.to(cfg.device)
+        y = y.to(cfg.device)
 
-    y = arithmetic_payoff(S, K).unsqueeze(-1)   # [1,N,1]
-    X = features_from_Z(
-        Z,
-        dimX=cfg.dimX,
-        theta=(r, S0, sigma, K),
-        G=G,
-        T=cfg.T,
-    )  # [1,N,d]
+        if X.ndim != 3:
+            raise ValueError(f"这里要求3D数据 [B,N,d]，但拿到 X.shape={X.shape}")
 
-    theta_tensor = torch.stack([r, S0, sigma, K], dim=-1)  # [1,N,4]
+        theta_n, X_n = normalize(theta, X, norm)   # <<< 依赖你已有的 normalize
+        pred = net(theta_n, X_n)
 
-    theta_n, X_n = normalize(theta_tensor, X, norm)
-    pred = net(theta_n, X_n)
+        if pred.ndim == 2:
+            pred = pred.unsqueeze(-1)
+        if y.ndim == 2:
+            y = y.unsqueeze(-1)
 
-    if pred.ndim == 2:
-        pred = pred.unsqueeze(-1)
-    if y.ndim == 2:
-        y = y.unsqueeze(-1)
+        assert pred.shape == y.shape, f"pred/y shape mismatch: {pred.shape} vs {y.shape}"
 
-    assert pred.shape == y.shape, f"pred/y shape mismatch: {pred.shape} vs {y.shape}"
+        # 每个 group 一个标量
+        ybar = y.mean(dim=1).squeeze(-1)     # [B]
+        gbar = pred.mean(dim=1).squeeze(-1)  # [B]
 
-    ybar = float(y.mean(dim=1).squeeze(-1).item())      # 标量
-    gbar = float(pred.mean(dim=1).squeeze(-1).item())   # 标量
-    return ybar, gbar
+        ybar_all.append(ybar.detach().cpu().numpy())
+        gbar_all.append(gbar.detach().cpu().numpy())
+
+    ybar_all = np.concatenate(ybar_all, axis=0).astype(np.float64)
+    gbar_all = np.concatenate(gbar_all, axis=0).astype(np.float64)
+    return ybar_all, gbar_all
 
 
+# =============================
+# helper: compute beta/corr/vars from pairs
+# =============================
+def beta_stats_from_pairs(ybar_all: np.ndarray, gbar_all: np.ndarray):
+    """
+    给定 nrep 个 ybar/gbar：
+      beta = cov(ybar,gbar)/var(gbar)
+      corr(ybar,gbar)
+      var(ybar)
+      var(ybar - beta*gbar)
+    """
+    ybar_all = np.asarray(ybar_all, dtype=np.float64).reshape(-1)
+    gbar_all = np.asarray(gbar_all, dtype=np.float64).reshape(-1)
+
+    var_y = _np_sample_var(ybar_all)
+    var_g = _np_sample_var(gbar_all)
+    cov_yg = _np_sample_cov(ybar_all, gbar_all)
+    corr_yg = _np_sample_corr(ybar_all, gbar_all)
+
+    if (not np.isfinite(var_g)) or abs(var_g) < 1e-30:
+        beta = float("nan")
+        var_resid = float("nan")
+    else:
+        beta = float(cov_yg / var_g)
+        resid = ybar_all - beta * gbar_all
+        var_resid = _np_sample_var(resid)
+
+    return {
+        "nrep": int(ybar_all.size),
+        "beta": float(beta),
+        "corr": float(corr_yg),
+        "var_ybar": float(var_y),
+        "var_resid": float(var_resid),  # Var(ybar - beta*gbar)
+    }
+
+
+# =============================
+# main: beta curve by N with nrep reps
+# =============================
 @torch.no_grad()
-def estimate_beta_curve_by_N_rep_loop(net, norm, cfg, theta_fixed, N_list, num_reps=None, seed_base=None):
+def estimate_beta_curve_by_N_nrep(
+    net,
+    norm: dict,
+    cfg,
+    theta_fixed,          # 用你现有的 theta_fixed 结构（传给 sample_theta 的 theta_same）
+    N_list,
+    nrep: int = 64,
+    loader_batch_size=None,
+    base_seed: int | None = None,
+):
     """
-    rep循环模式（你要的）：
-      对每个 N，做 num_reps 次 fresh rep
-      每个 rep 产出一个 (ybar_rep, gbar_rep)
-      最后在 reps 维度上计算:
-        var/cov/corr/beta/vr_ratio
-
-    返回:
-      beta_rows: 聚合统计（每个N一行）
-      beta_rep_pairs: 每个N对应的 rep 级 (ybar,gbar) 序列，后续可复用
+    对每个 N：
+      - 重复 nrep 次（每次生成 1 个 group: B=1, N=N_group），seed 每次变
+      - 得到 nrep 个 ybar/gbar
+      - 计算并打印：beta, corr, var(ybar), var(ybar - beta*gbar)
+    依赖你已有函数：
+      - sample_theta(mode=3, ...)
+      - generate_dataset(cfg, theta=(r,S0,sigma,K,H))
+      - normalize(theta, X, norm)
     """
-    if num_reps is None:
-        num_reps = int(cfg.beta_num_reps)
-    if seed_base is None:
-        seed_base = int(cfg.beta_rep_seed_base)
+    rows = []
+    if base_seed is None:
+        base_seed = int(getattr(cfg, "seed", 0))+10000
 
-    beta_rows = []
-    beta_rep_pairs = {}  # {str(N): {"ybar_reps":[...], "gbar_reps":[...]}}
+    for N_group in N_list:
+        ybars = np.empty((nrep,), dtype=np.float64)
+        gbars = np.empty((nrep,), dtype=np.float64)
 
-    for idx_N, N_group in enumerate(N_list):
-        ybar_reps = []
-        gbar_reps = []
+        for rep in range(nrep):
+            cfg_rep = copy.copy(cfg)
+            cfg_rep.seed = base_seed + rep  # 关键：让每次 RQMC scramble/shift 不同（前提是你模拟器用到了 seed）
 
-        for rep in range(int(num_reps)):
-            # 给每个 N / rep 一个稳定且不冲突的 seed
-            rep_seed = int(seed_base + idx_N * 1_000_000 + rep)
-
-            ybar, gbar = _compute_ybar_gbar_one_rep(
-                net=net,
-                norm=norm,
-                cfg=cfg,
-                theta_fixed=theta_fixed,
-                N_group=int(N_group),
-                rep_seed=rep_seed,
+            # 生成固定theta的 3D 参数 [B=1, N_group]
+            r, S0, sigma, K= sample_theta(
+                mode=3,
+                batch_size=1,
+                B=1,
+                N=int(N_group),
+                is_same=True,
+                theta_same=theta_fixed,
+                device=cfg_rep.device
             )
-            ybar_reps.append(ybar)
-            gbar_reps.append(gbar)
 
-        ybar_reps = np.asarray(ybar_reps, dtype=np.float64)
-        gbar_reps = np.asarray(gbar_reps, dtype=np.float64)
+            dataset_beta = generate_dataset(cfg_rep, theta=(r, S0, sigma, K))
+            ybar_rep, gbar_rep = collect_ybar_gbar_pairs(
+                net=net,
+                dataset=dataset_beta,
+                norm=norm,
+                cfg=cfg_rep,
+                loader_batch_size=loader_batch_size
+            )
 
-        var_y = _np_sample_var(ybar_reps)
-        var_g = _np_sample_var(gbar_reps)
-        cov_yg = _np_sample_cov(ybar_reps, gbar_reps)
-        corr_yg = _np_sample_corr(ybar_reps, gbar_reps)
+            if ybar_rep.size != 1 or gbar_rep.size != 1:
+                raise ValueError(f"期望每次rep得到1个group，但 got ybar={ybar_rep.shape}, gbar={gbar_rep.shape}")
 
-        if (not np.isfinite(var_g)) or abs(var_g) < 1e-30:
-            beta = float("nan")
-        else:
-            beta = float(cov_yg / var_g)
+            ybars[rep] = float(ybar_rep[0])
+            gbars[rep] = float(gbar_rep[0])
 
-        alpha = float(ybar_reps.mean() - beta * gbar_reps.mean()) if np.isfinite(beta) else float("nan")
+        stats = beta_stats_from_pairs(ybars, gbars)
+        row = {"N": int(N_group), **stats}
+        rows.append(row)
 
-        if np.isfinite(beta):
-            resid = ybar_reps - beta * gbar_reps
-            var_resid = _np_sample_var(resid)
-        else:
-            var_resid = float("nan")
-
-        row = {
-            "N": int(N_group),
-            "num_reps": int(num_reps),
-
-            "mean_ybar": float(ybar_reps.mean()),
-            "mean_gbar": float(gbar_reps.mean()),
-
-            "var_ybar": float(var_y),
-            "var_gbar": float(var_g),
-            "cov_ybar_gbar": float(cov_yg),
-            "corr_ybar_gbar": float(corr_yg),
-
-            "beta_cv": float(beta),
-            "alpha_ols": float(alpha),
-            "var_ybar_minus_beta_gbar": float(var_resid),
-            "vr_ratio_vs_ybar": float(var_resid / var_y)
-            if np.isfinite(var_resid) and np.isfinite(var_y) and abs(var_y) > 0
-            else float("nan"),
-        }
-        beta_rows.append(row)
-
-        beta_rep_pairs[str(int(N_group))] = {
-            "ybar_reps": ybar_reps.tolist(),
-            "gbar_reps": gbar_reps.tolist(),
-        }
-
+        # 按你要的 4 个量打印：beta, corr, var(ybar), var(ybar-beta*gbar)
         print(
-            f"[Beta-rep] N={N_group:5d} | reps={num_reps:4d} | "
-            f"beta={row['beta_cv']:.8f} | "
-            f"corr={row['corr_ybar_gbar']:.6f} | "
-            f"vr_ratio={row['vr_ratio_vs_ybar']:.6f}"
+            f"[Beta-nrep] N={row['N']:5d} | nrep={row['nrep']:4d} | "
+            f"beta={row['beta']:.8f} | "
+            f"corr={row['corr']:.6f} | "
+            f"var_ybar={row['var_ybar']:.6e} | "
+            f"var_resid={row['var_resid']:.6e}"
         )
 
-    return beta_rows, beta_rep_pairs
-
+    return rows
 
 # =============================
 # 6) Main
@@ -642,15 +654,17 @@ def main():
 
     # ===== 估计 beta(N) 曲线（rep-loop mode）=====
     print("\n===== Estimate beta(N) by rep-loop on fresh 3D datasets (fixed theta) =====")
-    beta_rows, beta_rep_pairs = estimate_beta_curve_by_N_rep_loop(
+    beta_rows = estimate_beta_curve_by_N_nrep(
         net=net,
         norm=norm,
         cfg=cfg,
         theta_fixed=theta_fixed,
         N_list=cfg.beta_N_list,
-        num_reps=cfg.beta_num_reps,
-        seed_base=cfg.beta_rep_seed_base
+        nrep=cfg.nrep_beta,  # 原来的 B_beta 现在当作 nrep
+        loader_batch_size=1,  # 每次rep只生成1个group，1最稳
+        base_seed=cfg.seed  # 可选：控制可复现
     )
+
 
     # 轻量映射：N -> beta
     beta_map = {

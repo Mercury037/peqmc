@@ -387,40 +387,6 @@ def build_coarse_gbm_path_from_Z(
     return S_coarse
 
 
-# =========================================================
-# 2) 回望期权专用：粗轨道 lookback proxy（只要 2 维）
-# =========================================================
-# def coarse_lookback_struct2_from_Z_gbm(
-#     Z: torch.Tensor,
-#     k_proxy: int,
-#     *,
-#     r,
-#     S0,
-#     sigma,
-#     K,
-#     G: torch.Tensor,
-#     T: float = 1.0,
-# ):
-#     """
-#     返回:
-#       struct2: [..., 2]
-#         [s_max, s_max_minus_K]
-#
-#     说明：
-#       - s_max_minus_K 不做 clamp，保持符号信息；payoff 中再做 (·)^+
-#       - K 支持标量 / [B] / [B,N] 广播
-#     """
-#     S_coarse = build_coarse_gbm_path_from_Z(
-#         Z, r=r, S0=S0, sigma=sigma, G=G, T=T, k_proxy=k_proxy
-#     )  # [..., nD]
-#
-#     s_max = S_coarse.max(dim=-1, keepdim=True).values   # [..., 1]
-#     Kt = _broadcast_to(K, s_max)                        # [..., 1]
-#     s_max_minus_K = s_max - Kt
-#
-#     struct2 = torch.cat([s_max, s_max_minus_K], dim=-1) # [..., 2]
-#     return struct2
-
 def coarse_lookback_struct2_from_Z_gbm(
     Z: torch.Tensor,
     k_proxy: int,
